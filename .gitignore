@@ -1,0 +1,8 @@
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.pem
+*.key
+.env
+awscliv2.zip
+aws/
