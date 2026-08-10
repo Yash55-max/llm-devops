@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-api-deployment
+  namespace: llm-serving
+  labels:
+    app: llm-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: llm-api
+  template:
+    metadata:
+      labels:
+        app: llm-api
+    spec:
+      containers:
+      - name: llm-api
+        image: llm-api:day3
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+        env:
+        # Kubernetes In-Cluster DNS endpoint for the Ollama Service
+        - name: OLLAMA_HOST
+          value: "http://ollama-service.llm-serving.svc.cluster.local:11434"
+        - name: MODEL_NAME
+          value: "qwen2.5:0.5b"
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 10
