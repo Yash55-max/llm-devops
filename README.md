@@ -87,17 +87,17 @@ End-to-end Kubernetes-based deployment platform for serving Open-Source LLMs wit
 │  │                  │                                       │
 │  │  API / Inference │                                       │
 │  └────────┬─────────┘                                       │
-│           │                                                  │
-│           │ Kubernetes DNS                                   │
-│           │ ollama-service.llm-serving.svc.cluster.local     │
-│           ▼                                                  │
+│           │                                                 │
+│           │ Kubernetes DNS                                  │
+│           │ ollama-service.llm-serving.svc.cluster.local    │
+│           ▼                                                 │
 │  ┌──────────────────┐                                       │
 │  │ Ollama Service   │                                       │
 │  │                  │                                       │
 │  │ ClusterIP:11434  │                                       │
 │  └────────┬─────────┘                                       │
-│           │                                                  │
-│           ▼                                                  │
+│           │                                                 │
+│           ▼                                                 │
 │  ┌──────────────────┐                                       │
 │  │   Ollama Pod     │                                       │
 │  │                  │                                       │
