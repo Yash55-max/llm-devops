@@ -105,3 +105,84 @@ End-to-end Kubernetes-based deployment platform for serving Open-Source LLMs wit
 │  └──────────────────┘                                       │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
+## Day 4: Automated CI/CD Pipeline & Container Registry Integration
+
+### Accomplished
+
+- [x] Automated CI/CD workflow created using GitHub Actions (`.github/workflows/ci.yaml`)
+- [x] Code quality and linting automated using `ruff`
+- [x] Automated unit test suite implemented using `pytest`
+- [x] Pydantic schema validation verified
+- [x] `/health` probe logic verified
+- [x] Container image builds automated
+- [x] Container images published to GitHub Container Registry (GHCR)
+- [x] Immutable image tagging strategy implemented using Git commit SHAs (`${{ github.sha }}`)
+
+### Architectural Rationale & Design Patterns
+
+- **Static Code Analysis (`ruff`)**: Integrated high-performance Python linting into the CI pipeline to enforce code-quality standards and maintain consistent import ordering before container image assembly.
+
+- **Automated Verification (`pytest`)**: Unit tests execute automatically on every push and pull request targeting `main`. This provides an early validation layer for API behavior, Pydantic schemas, and health-check endpoints before artifacts are built.
+
+- **Immutable Artifact Strategy**: Container images are tagged using the Git commit SHA (`${{ github.sha }}`), creating a deterministic relationship between source code and the resulting artifact. This avoids the ambiguity associated with mutable tags such as `:latest`.
+
+- **GitHub Container Registry (GHCR)**: GHCR is used as the centralized container artifact registry, providing a persistent location for versioned images that can later be consumed by Kubernetes or a GitOps deployment controller.
+
+- **Deliberate Deployment Boundary**: The CI pipeline intentionally terminates after publishing the container image. Automated deployment to the local `kind` cluster is excluded because GitHub-hosted runners cannot directly access the developer's local Kubernetes network namespace without additional tunneling or self-hosted infrastructure.
+
+- **GitOps Readiness**: Stopping at artifact publication establishes a clean separation between **CI** and **CD**. The resulting immutable image can later become the deployment input for a remote Kubernetes cluster and GitOps controller.
+
+### CI/CD Pipeline Flow
+
+```text
+                         Git Repository
+                              │
+                              │ Push / Pull Request
+                              ▼
+                    ┌─────────────────────┐
+                    │    GitHub Actions   │
+                    │      CI Runner      │
+                    └──────────┬──────────┘
+                               │
+                  ┌────────────┼────────────┐
+                  │            │            │
+                  ▼            ▼            ▼
+             ┌────────┐   ┌────────┐   ┌─────────────┐
+             │  Ruff  │   │ Pytest │   │ Pydantic /  │
+             │ Linting│   │  Tests │   │ Health Check│
+             └────┬───┘   └────┬───┘   └──────┬──────┘
+                  │            │              │
+                  └────────────┼──────────────┘
+                               │
+                         Validation Pass
+                               │
+                               ▼
+                    ┌─────────────────────┐
+                    │  Docker Image Build │
+                    └──────────┬──────────┘
+                               │
+                               │ Tag:
+                               │ <github-sha>
+                               ▼
+                    ┌─────────────────────┐
+                    │        GHCR         │
+                    │ GitHub Container    │
+                    │      Registry       │
+                    └──────────┬──────────┘
+                               │
+                               │ Immutable Artifact
+                               ▼
+                    ┌─────────────────────┐
+                    │   Future CD /       │
+                    │   GitOps Layer      │
+                    └──────────┬──────────┘
+                               │
+                               ▼
+                    ┌─────────────────────┐
+                    │ Remote Kubernetes   │
+                    │      Cluster        │
+                    └─────────────────────┘
+
+                    ─────────────────────
+                     CURRENT DAY 4 STOP
+                    ─────────────────────
