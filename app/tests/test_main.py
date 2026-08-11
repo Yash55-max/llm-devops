@@ -33,3 +33,4 @@ def test_generate_endpoint_invalid_payload():
     """Verify that missing required prompt field returns HTTP 422 Unprocessable Entity."""
     response = client.post("/generate", json={})
     assert response.status_code == 422
+    
