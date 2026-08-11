@@ -1,6 +1,6 @@
 from fastapi.testclient import TestClient
 
-from main import GenerateRequest, app
+from ..main import GenerateRequest, app
 
 client = TestClient(app)
 
