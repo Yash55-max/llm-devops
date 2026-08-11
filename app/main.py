@@ -1,4 +1,5 @@
 import os
+
 import httpx
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
@@ -62,5 +63,5 @@ async def generate(payload: GenerateRequest):
         except httpx.HTTPStatusError as e:
             raise HTTPException(
                 status_code=e.response.status_code,
-                detail=f"Ollama returned error: {e.response.text}"
+                detail=f"Ollama returned error: {e.response.text}",
             )
