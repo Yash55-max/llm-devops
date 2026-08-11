@@ -22,7 +22,9 @@ End-to-end Kubernetes-based deployment platform for serving Open-Source LLMs wit
 ### Architectural Rationale & Design Patterns
 
 - **Non-root AWS IAM Access**: Used a dedicated IAM administrator identity instead of the AWS root account to reduce operational and security risk.
+
 - **Local Kubernetes via kind**: Chosen to provide a reproducible multi-node Kubernetes environment without incurring cloud infrastructure costs during development.
+
 - **Cost Guardrails**: AWS billing alerts were configured before beginning cloud infrastructure work to prevent unexpected resource consumption.
 
 ---
@@ -42,8 +44,11 @@ End-to-end Kubernetes-based deployment platform for serving Open-Source LLMs wit
 ### Architectural Rationale & Design Patterns
 
 - **CPU-based Serving**: Retained Ollama GGUF quantized models on CPU to avoid GPU overhead and unnecessary infrastructure costs in local `kind` clusters.
+
 - **Persistent Storage (`ollama-pvc`)**: Mounted a 5Gi PVC to `/root/.ollama` to decouple model-weight storage from pod lifecycles, eliminating unnecessary model re-downloads after pod restarts.
+
 - **Init Container Bootstrap Pattern**: Introduced an `initContainer` named `model-puller` to verify Ollama readiness using `ollama list` and fetch `qwen2.5:0.5b` model weights before the primary serving container starts.
+
 - **Container Lifecycle Separation**: Model initialization is isolated from the serving process, allowing the main Ollama container to start only after the required model artifacts are available.
 
 ---
@@ -105,6 +110,10 @@ End-to-end Kubernetes-based deployment platform for serving Open-Source LLMs wit
 │  └──────────────────┘                                       │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## Day 4: Automated CI/CD Pipeline & Container Registry Integration
 
 ### Accomplished
@@ -186,3 +195,54 @@ End-to-end Kubernetes-based deployment platform for serving Open-Source LLMs wit
                     ─────────────────────
                      CURRENT DAY 4 STOP
                     ─────────────────────
+```
+
+### Artifact Versioning Strategy
+
+```text
+Git Commit
+   │
+   │ abc1234...
+   ▼
+GitHub Actions
+   │
+   │ Docker Build
+   ▼
+GHCR Image
+   │
+   └── <image>:abc1234...
+
+Source Code ───────────────► Container Image
+     │                              │
+     │                              │
+     └──── Git SHA ─────────────────┘
+              │
+              ▼
+        Full Traceability
+```
+
+### Key CI/CD Pattern
+
+```text
+Code
+ │
+ ▼
+Lint
+ │
+ ▼
+Test
+ │
+ ▼
+Build
+ │
+ ▼
+Tag with Git SHA
+ │
+ ▼
+Push to GHCR
+ │
+ ▼
+Future GitOps Deployment
+```
+
+---
