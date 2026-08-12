@@ -2,8 +2,8 @@ import os
 
 import httpx
 from fastapi import FastAPI, HTTPException, status
-from pydantic import BaseModel, Field
 from prometheus_fastapi_instrumentator import Instrumentator
+from pydantic import BaseModel, Field
 
 app = FastAPI(
     title="LLM API Wrapper",
