@@ -3,12 +3,16 @@ import os
 import httpx
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
+from prometheus_fastapi_instrumentator import Instrumentator
 
 app = FastAPI(
     title="LLM API Wrapper",
     description="FastAPI service wrapper around internal Ollama model server",
     version="1.0.0"
 )
+
+# Initialize Prometheus instrumentator
+Instrumentator().instrument(app).expose(app)
 
 # Fetch internal Ollama URL from environment variable; default to localhost for local testing
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")

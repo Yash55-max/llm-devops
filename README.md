@@ -246,3 +246,93 @@ Future GitOps Deployment
 ```
 
 ---
+---
+
+## Day 5: Observability Stack — Prometheus, Grafana & Golden Signals Dashboard
+
+### Accomplished
+- [x] FastAPI application instrumented using `prometheus-fastapi-instrumentator`
+- [x] `/metrics` endpoint exposed on the API service
+- [x] `kube-prometheus-stack` deployed via Helm into a dedicated `monitoring` namespace
+- [x] `ServiceMonitor` (`llm-api-servicemonitor`) configured to scrape the API service
+- [x] Prometheus target verified as `UP` with successful scrape health
+- [x] Grafana dashboard built with three golden-signal panels:
+  - Request rate
+  - P95 latency
+  - Error rate
+- [x] Dashboard exported as JSON and version-controlled (`monitoring/dashboards/golden-signals.json`)
+- [x] Load-tested end-to-end pipeline to validate live metric flow
+
+### Dashboard Preview
+
+![Golden Signals Dashboard](monitoring/dashboards/golden_signals.png)
+
+### Architectural Rationale & Design Patterns
+- **`kube-prometheus-stack` over hand-rolled manifests**: Used the community Helm chart (Prometheus + Grafana + Alertmanager bundled) rather than deploying each component manually. This mirrors how most real infrastructure teams operate this stack and avoids reinventing scrape-config plumbing.
+- **ServiceMonitor as the scrape-config abstraction**: Rather than editing Prometheus's scrape config directly, a `ServiceMonitor` CRD declares *what* to scrape declaratively, and the Prometheus Operator reconciles it. This is the standard Kubernetes-native pattern for metrics discovery.
+- **Golden Signals over exhaustive metrics**: The dashboard intentionally limits scope to request rate, latency (p95), and error rate — the three signals most directly tied to service health — rather than dumping every available metric onto one panel. Readability over completeness.
+- **Immutable image tagging paid off**: The Day 4 SHA-based tagging strategy made it trivial to distinguish "old code, still running" from "new code, not yet deployed" once the stale-image bug surfaced (see below).
+
+### Debugging Log
+
+This was the real work of the day. Every fix below was a genuine dead-end resolved by checking one layer deeper — documented here because tracing failures across a distributed system is a stronger signal of competency than a dashboard screenshot alone.
+
+**1. Prometheus silently ignoring the ServiceMonitor (label selector mismatch)**
+- Symptom: `ServiceMonitor` existed, but Prometheus's Service Discovery page showed nothing.
+- Root cause: `kube-prometheus-stack`'s Prometheus CR only watches `ServiceMonitors` carrying a `release: prometheus-stack` label by default (`spec.serviceMonitorSelector.matchLabels`). The custom `ServiceMonitor` didn't have it, so it was invisible to Prometheus — no error, just silence.
+- Fix: added `labels: { release: prometheus-stack }` to the `ServiceMonitor`'s metadata and re-applied.
+
+**2. ServiceMonitor discovered, but "0/0 No targets"**
+- Symptom: label fix resolved discovery, but the scrape pool showed zero targets.
+- Root cause: the underlying `Service` (`llm-api-service`) had no live endpoints — meaning zero pods were actually running.
+- Investigation: `kubectl get deployments -n llm-serving` showed both deployments at `0/0` desired replicas, with `kubectl get events` returning nothing (no crash, no OOM, no scheduling failure — replicas had simply been set to zero, without any recorded event trail).
+- Fix: `kubectl scale deployment <name> -n llm-serving --replicas=1` for both deployments.
+
+**3. Target `UP` in discovery, but scraping failed with `404 Not Found`**
+- Symptom: pod resolved correctly, Prometheus reached it over the network, but `/metrics` returned 404.
+- Root cause: the running pod was serving a stale image built on Day 3, before Prometheus instrumentation was added to `main.py` on Day 5. The code was correct — it had simply never been rebuilt and reloaded into the `kind` cluster.
+- Fix: `docker build` → `kind load docker-image` → bumped the image tag in the Deployment manifest → `kubectl apply` → confirmed `/metrics` returned valid Prometheus-format output before re-checking Prometheus.
+
+**4. Port drift between local YAML, live cluster state, and the container**
+- Symptom: `kubectl port-forward` failed with "Service does not have a service port 8001."
+- Root cause: `api-service.yaml` had been locally edited to `port: 8001` but never re-applied, while the Dockerfile and the live cluster Service were still on `8000` — three sources of truth had drifted out of sync with each other.
+- Fix: reverted the Service manifest to `8000` (matching the Dockerfile's `EXPOSE`/`uvicorn --port`), re-applied, and confirmed live cluster state matched the file before proceeding.
+
+**Takeaway:** every failure here traced back to a *silent* mismatch — a missing label, a stale image, a config file that was edited but never applied — none of which threw a loud error until the very last layer (`/targets` page, `curl`, or `port-forward`). This is the actual shape of Kubernetes/Prometheus debugging in production: work backward through the selector chain (Prometheus → ServiceMonitor → Service → Pod) one link at a time rather than guessing at the whole system.
+
+### Observability Data Flow
+```text
+                    Kubernetes Cluster
+┌───────────────────────────────────────────────────────────────┐
+│                                                                 │
+│  ┌──────────────────┐        /metrics        ┌───────────────┐│
+│  │   FastAPI Pod    │◄───────────────────────│  Prometheus   ││
+│  │  (instrumented)  │      scrape every 5s    │    Server     ││
+│  └──────────────────┘                         └───────┬───────┘│
+│                                                        │        │
+│                                            ServiceMonitor       │
+│                                          (release label match)  │
+│                                                        │        │
+│                                                        ▼        │
+│                                              ┌───────────────┐  │
+│                                              │    Grafana    │  │
+│                                              │   Dashboard   │  │
+│                                              │ (Golden Signals)│ │
+│                                              └───────────────┘  │
+│                                                                 │
+└───────────────────────────────────────────────────────────────┘
+```
+
+### Golden Signals Queries
+```promql
+# Request Rate
+sum(rate(http_requests_total{job="llm-api-service"}[1m]))
+
+# P95 Latency
+histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{job="llm-api-service"}[1m])) by (le))
+
+# Error Rate
+sum(rate(http_requests_total{job="llm-api-service", status=~"4..|5.."}[1m])) or vector(0)
+```
+
+---

@@ -1,0 +1,15 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: llm-api-servicemonitor
+  namespace: llm-serving
+  labels:
+    release: prometheus-stack  
+spec:
+  selector:
+    matchLabels:
+      app: llm-api
+  endpoints:
+  - targetPort: 8000
+    path: /metrics
+    interval: 5s

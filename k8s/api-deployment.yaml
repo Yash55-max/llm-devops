@@ -12,12 +12,13 @@ spec:
       app: llm-api
   template:
     metadata:
+
       labels:
         app: llm-api
     spec:
       containers:
       - name: llm-api
-        image: llm-api:day3
+        image: llm-api:day5
         imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 8000
