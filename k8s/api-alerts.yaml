@@ -1,0 +1,42 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: llm-api-alerts
+  namespace: llm-serving
+  labels:
+    release: prometheus-stack
+spec:
+  groups:
+    - name: llm-api.rules
+      rules:
+        - alert: HighErrorRate
+          expr: |
+            sum(rate(http_requests_total{job="llm-api-service", status=~"5.."}[5m]))
+            /
+            sum(rate(http_requests_total{job="llm-api-service"}[5m])) > 0.05
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "LLM API error rate above 5%"
+            description: "More than 5% of requests to llm-api-service have been failing for over 2 minutes."
+
+        - alert: PodNotReady
+          expr: |
+            kube_pod_status_ready{namespace="llm-serving", condition="true"} == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Pod in llm-serving is not ready"
+            description: "A pod in the llm-serving namespace has been not-ready for over 1 minute."
+
+        - alert: HighLatencyP95
+          expr: |
+            histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{job="llm-api-service"}[5m])) by (le)) > 2
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "LLM API p95 latency above 2s"
+            description: "95th percentile response time has exceeded 2 seconds for over 5 minutes."

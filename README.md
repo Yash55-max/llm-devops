@@ -336,3 +336,127 @@ sum(rate(http_requests_total{job="llm-api-service", status=~"4..|5.."}[1m])) or 
 ```
 
 ---
+---
+
+## Day 6: Alerting — Alertmanager, PrometheusRule & Incident Lifecycle Validation
+
+### Accomplished
+- [x] Alertmanager enabled via Helm upgrade (was disabled by default in the original chart install)
+- [x] Verified Prometheus → Alertmanager delivery path via `alerting.alertmanagers` config
+- [x] Three `PrometheusRule` alerts authored and deployed (`k8s/api-alerts.yaml`):
+  - `HighErrorRate` — fires when 5xx ratio exceeds 5% for 2+ minutes
+  - `PodNotReady` — fires when any pod in `llm-serving` is not-ready for 1+ minute
+  - `HighLatencyP95` — fires when p95 latency exceeds 2s for 5+ minutes
+- [x] Forced a real outage (Ollama scaled to zero) to validate the full alert lifecycle
+- [x] Confirmed alert transition: `Inactive` → `Pending` → `Firing` → resolved
+- [x] Confirmed alert delivery into Alertmanager's UI, distinct from built-in `kube-system` noise alerts
+- [x] Diagnosed and fixed a Grafana dashboard persistence bug (dashboards lost on pod restart)
+- [x] Re-imported the golden-signals dashboard from Day 5's exported JSON and confirmed recovery
+
+### Incident & Alert Validation Previews
+
+#### Full Golden Signals Incident Lifecycle Dashboard
+![Incident Lifecycle Dashboard](monitoring/dashboards/incident_lifecycle_dashboard.png)
+
+#### Error Rate Spike Drilldown (Threshold Breach at 01:03:30)
+![Error Rate Drilldown](monitoring/dashboards/error-rate.png)
+
+#### Prometheus Alert State Transition: Pending (01:04:48)
+*Threshold breached; alert enters the 2-minute debounce window (`for: 2m`) to prevent transient false alarms:*
+![Alert Pending State](monitoring/dashboards/alert_pending.png)
+
+#### Prometheus Alert State Transition: Firing (01:06:23)
+*Failure condition sustained for over 2 minutes; alert transitions to FIRING and routes to Alertmanager:*
+![Alert Firing State](monitoring/dashboards/alert_firing.png)
+
+### Architectural Rationale & Design Patterns
+- **`PrometheusRule` over manual Alertmanager config**: Same declarative CRD pattern as `ServiceMonitor` — alert rules live as version-controlled Kubernetes objects, reconciled automatically by the Prometheus Operator, rather than hand-edited into a running config file.
+- **`for:` durations on every rule**: Each alert requires its condition to hold for a sustained window (1-5 minutes depending on severity) before firing. This is a deliberate choice to avoid alert fatigue from single-request blips or transient scheduling noise — a core SRE practice, not just a Prometheus syntax requirement.
+- **Real outage over synthetic testing**: Rather than trusting the rule YAML in isolation, the `HighErrorRate` alert was validated by actually taking a dependency offline (`ollama-deployment` scaled to zero) and observing the app's real failure behavior (`503` responses via the `httpx.ConnectError` handler built on Day 3). This proves the alert reflects genuine service degradation, not just a syntactically valid query.
+- **Stateless Grafana as a design flaw, not a given**: Grafana's default Helm install stores dashboards in the pod's local SQLite database with no persistent volume. Any pod restart — Docker Desktop restart, resource pressure, node reschedule — silently wipes every UI-created dashboard with no warning. This is treated here as a bug to fix, not an accepted limitation.
+
+### Debugging Log
+
+**1. Alertmanager pods not running — “disabled” in Status page**
+- Symptom: `kubectl get pods -n monitoring | grep alertmanager` returned nothing.
+- Root cause: `alertmanager.enabled: false` had been explicitly set in the Helm values during the original Day 5 install (likely to conserve local CPU/memory during initial stack setup).
+- Fix: `helm upgrade` with `--reuse-values` and `--set alertmanager.enabled=true`, plus deliberately small resource requests/limits to stay within the local `kind` cluster's CPU budget.
+- Note: the Alertmanager UI's "Cluster Status: disabled" after fixing this was a false alarm — it refers to Alertmanager's gossip clustering for multi-replica HA, which is correctly disabled for a single-replica local instance. Not an error.
+
+**2. Ten alerts appeared in Alertmanager that were never authored**
+- Symptom: `namespace="kube-system"` group showed 10 firing alerts (`etcdInsufficientMembers`, `KubeProxyInstanceUnreachable`, `TargetDown`, etc.) immediately after enabling Alertmanager.
+- Root cause: these are built-in control-plane health alerts shipped by default with `kube-prometheus-stack`. `kind` clusters don't expose the same control-plane metrics endpoints a managed cluster (EKS/GKE) does, so these fire continuously and are expected noise on any local `kind` setup — unrelated to the application.
+- Resolution: documented as expected behavior rather than "fixed" — no config change needed, just correctly identified as out of scope.
+
+**3. `HighErrorRate` rule wouldn't have fired against the original test plan**
+- Initial plan was to hit a nonexistent route to generate 404s, but the rule's `status=~"5.."` filter only matches 5xx, not 4xx.
+- Corrected the test plan instead of the rule: scaled `ollama-deployment` to zero, which makes `/generate` genuinely unreachable and produces real `503`s — matching the rule's actual intent (backend dependency failure) rather than a client-error edge case.
+
+**4. Grafana dashboard vanished after a Helm upgrade — "Dashboard not found"**
+- Symptom: the Day 5 golden-signals dashboard, previously working, returned a 404 inside Grafana after enabling Alertmanager and later after enabling Grafana persistence.
+- Root cause: Grafana's dashboards are stored in an internal SQLite DB inside the pod's ephemeral filesystem by default. Every pod restart (including the one triggered by `helm upgrade` itself) wipes any dashboard created through the UI.
+- Fix (short-term): re-imported the dashboard from the JSON exported on Day 5 (`monitoring/dashboards/golden-signals.json`) — validating that the earlier discipline of exporting dashboards-as-code, not just building them in the UI, was what made recovery possible.
+- Fix (long-term): `helm upgrade` with `--set grafana.persistence.enabled=true --set grafana.persistence.size=1Gi`, mounting a PVC so Grafana's state survives future pod restarts.
+
+**5. "Failed to fetch" after the persistence fix**
+- Symptom: dashboard loaded, but all three panels showed "No data" with a "Failed to fetch" banner.
+- Root cause: enabling persistence restarted the Grafana pod, invalidating the existing `kubectl port-forward` tunnel, which was still pointed at the terminated pod.
+- Fix: killed and restarted the port-forward against the new pod/service, confirmed connectivity, panels populated immediately.
+
+**Takeaway:** today's failures were less about Kubernetes/Prometheus mechanics (those are largely solved from Day 5) and more about state and lifecycle assumptions — assuming a running pod is a stable pod, and assuming "it worked in the UI" means it's durable. Exporting dashboards as versioned JSON, small as that habit seemed on Day 5, was the difference between a five-minute recovery and losing the whole panel layout.
+
+### Incident Lifecycle — Validated End to End
+
+> [!IMPORTANT]
+> **Incident Lifecycle Dashboard Callout — The Complete Outage Narrative in One View:**
+> The incident-lifecycle dashboard screenshot above ([`monitoring/dashboards/incident_lifecycle_dashboard.png`](file:///home/yash55-max/projects/llm-devops/monitoring/dashboards/incident_lifecycle_dashboard.png)) captures the entire operational narrative across time in a single pane of glass rather than just a static snapshot:
+> 1. **Baseline Operations**: Steady nominal traffic (~0.4 req/s), baseline P95 latency (~90ms), and error rate flatlined at zero.
+> 2. **Fault Injection (01:03:30)**: Ollama deployment scaled to zero replicas (`kubectl scale deployment ollama-deployment --replicas=0`), cutting off the LLM inference backend.
+> 3. **Error Spike & Metric Surge**: FastAPI gracefully catches the connection drops (`httpx.ConnectError`) and issues HTTP 503 responses. The Error Rate panel surges to ~0.49 req/s (100% failure ratio matching the request rate), immediately crossing the 5% error ratio threshold ([`monitoring/dashboards/error-rate.png`](file:///home/yash55-max/projects/llm-devops/monitoring/dashboards/error-rate.png)).
+> 4. **Alert Transition (Pending $\rightarrow$ Firing)**: Prometheus marks `HighErrorRate` as **Pending** at 01:04:48 ([`monitoring/dashboards/alert_pending.png`](file:///home/yash55-max/projects/llm-devops/monitoring/dashboards/alert_pending.png)). Once the 2-minute `for:` window elapses at 01:06:23, it transitions to **Firing** ([`monitoring/dashboards/alert_firing.png`](file:///home/yash55-max/projects/llm-devops/monitoring/dashboards/alert_firing.png)) and dispatches to Alertmanager.
+> 5. **Remediation & Recovery**: Ollama deployment scaled back up to 1 replica. The error rate immediately plunges back to zero and Alertmanager auto-resolves the alert back to `Inactive`.
+
+```text
+ 1. Baseline           Ollama healthy, error rate = 0, all alerts Inactive
+         │
+         ▼
+ 2. Fault injected      kubectl scale deployment ollama-deployment --replicas=0
+         │
+         ▼
+ 3. App detects failure  httpx.ConnectError → FastAPI returns 503
+         │
+         ▼
+ 4. Metric shifts        error rate ratio crosses 5% threshold
+         │
+         ▼
+ 5. Rule evaluates true  HighErrorRate: Inactive → Pending (01:04:48)
+         │
+         │  (condition holds for full `for: 2m` window)
+         ▼
+ 6. Alert fires          HighErrorRate: Pending → Firing (01:06:23)
+         │
+         ▼
+ 7. Delivered            Alert appears in Alertmanager UI
+         │
+         ▼
+ 8. Fault resolved       kubectl scale deployment ollama-deployment --replicas=1
+         │
+         ▼
+ 9. Alert clears         HighErrorRate: Firing → Inactive
+```
+
+### Alert Rules Summary
+```promql
+# HighErrorRate — 5xx ratio > 5% for 2m
+sum(rate(http_requests_total{job="llm-api-service", status=~"5.."}[5m]))
+/
+sum(rate(http_requests_total{job="llm-api-service"}[5m])) > 0.05
+
+# PodNotReady — any pod not-ready for 1m
+kube_pod_status_ready{namespace="llm-serving", condition="true"} == 0
+
+# HighLatencyP95 — p95 latency > 2s for 5m
+histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{job="llm-api-service"}[5m])) by (le)) > 2
+```
+
+---
