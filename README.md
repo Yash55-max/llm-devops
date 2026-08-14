@@ -460,3 +460,102 @@ histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{job="llm-
 ```
 
 ---
+---
+
+## Day 7: Cloud Migration — AWS EC2 via Terraform
+
+### Accomplished
+- [x] Provisioned real AWS infrastructure using Terraform (`terraform/`):
+  - Single `t3.micro` EC2 instance (Ubuntu, 25Gi gp3 root volume)
+  - Dedicated security group scoped to the operator's IP only (SSH + port 8000)
+  - SSH key pair generated and managed via Terraform, not manually uploaded
+- [x] Installed Docker on the EC2 instance
+- [x] Deployed both containers directly via `docker run` (Docker-only today, not Kubernetes — EKS migration deliberately deferred to a later day)
+- [x] Created a custom Docker bridge network (`llm-net`) so the API container reaches Ollama by container name, not a hardcoded IP
+- [x] Pulled the API image from GHCR (Day 4's registry pipeline used in production for the first time)
+- [x] Verified `/health` and `/generate` endpoints responding correctly over the public internet, not just `localhost`
+- [x] Confirmed full teardown via `terraform destroy` — zero resources left running after verification
+
+### Deployment & Verification Previews
+
+#### EC2 Container Setup & Docker Bridge Network
+*Ollama initialization, model pull (`qwen2.5:0.5b`), resolving the GHCR container image name, and running both services under the custom `llm-net` network on AWS EC2:*
+![EC2 Docker Deployment](terraform/screenshots/ec2_docker_deployment.png)
+
+#### Public Internet Endpoint Verification
+*Live endpoint verification over the public EC2 IPv4 address (`43.204.228.127:8000`) for both `/health` and `/generate` inference:*
+![Public Endpoint Verification](terraform/screenshots/public_endpoint_verification.png)
+
+### Architectural Rationale & Design Patterns
+- **EC2 + Docker before EKS**: deliberately scoped today to plain Docker on a single EC2 instance rather than jumping straight to a managed Kubernetes control plane. EKS's control plane alone costs roughly $73/month if left running — not worth the spend or the added complexity before the basic cloud-networking and registry-auth pieces were proven to work. EKS migration is planned as a separate, later effort, reusing the Kubernetes manifests already written on Days 2-6.
+- **IP-scoped security group, not `0.0.0.0/0`**: both SSH (22) and the API port (8000) are restricted to the operator's IP via a Terraform `data.http` lookup at apply time, rather than exposing an unauthenticated LLM endpoint to the entire internet. A convenient default for tutorials, but not one worth carrying into a portfolio project meant to demonstrate real judgment.
+- **Docker bridge network for service discovery**: the `llm-net` custom network lets the API container resolve Ollama via its container name (`http://ollama:11434`) rather than a hardcoded IP — the same DNS-based service-discovery principle established in Day 3's Kubernetes work, applied at the Docker level instead. Reinforces that the pattern isn't Kubernetes-specific; it's a general "don't hardcode network identity" practice.
+- **Immutable image, reused, not rebuilt**: the exact image built and pushed to GHCR in Day 4's CI pipeline was pulled and run unmodified on EC2 — the artifact produced by CI is the same artifact deployed here, no local rebuild step. This is the traceability the SHA-tagging strategy was meant to provide, now exercised for real.
+- **Aggressive teardown discipline**: infrastructure was destroyed immediately after verification rather than left running for convenience. With a fixed $110 credit budget, `terraform destroy` after every session — not "when I remember to" — is the operating discipline, not an afterthought.
+
+### Debugging Log
+
+**1. GHCR pull denied — "docker: Error response from daemon: error from registry: denied"**
+- Symptom: `docker run` against `ghcr.io/yash55-max/llm-api:latest` failed twice with a registry `denied` error.
+- Root cause: simple naming mismatch — the package was actually published under `llm-devops`, not `llm-api`. Not a permissions or authentication issue; the image genuinely didn't exist at the referenced path.
+- Fix: corrected the image reference to `ghcr.io/yash55-max/llm-devops:latest`, pull succeeded immediately ([`terraform/screenshots/ec2_docker_deployment.png`](file:///home/yash55-max/projects/llm-devops/terraform/screenshots/ec2_docker_deployment.png)).
+
+**2. SSH session dropped mid-verification — "Connection to 43.204.228.127 closed by remote host"**
+- Symptom: SSH session terminated unexpectedly right after successful endpoint testing.
+- Root cause: not a fault — `terraform destroy` was run from a separate local terminal immediately after the public-IP curl tests succeeded, tearing down the EC2 instance out from under the active SSH session ([`terraform/screenshots/ec2_docker_deployment.png`](file:///home/yash55-max/projects/llm-devops/terraform/screenshots/ec2_docker_deployment.png)). Expected behavior given the intentional teardown discipline, not a bug.
+
+### Verified Public Endpoint
+```bash
+curl http://43.204.228.127:8000/health
+# {"status":"ok","ollama_host":"http://ollama:11434"}
+
+curl -X POST http://43.204.228.127:8000/generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Explain Cloud Computing in one sentence."}'
+# {"model":"qwen2.5:0.5b","response":"Cloud computing is a model of computing in which
+#  various applications and data are stored, processed, and accessed over the internet
+#  through a network, where the underlying infrastructure is managed by a service provider
+#  such as Amazon Web Services..."}
+```
+
+### Deployment Flow
+```text
+ Local machine                     GitHub                          AWS
+┌──────────────┐   git push   ┌───────────────┐  docker build  ┌──────────────┐
+│  Source code │ ────────────▶│ GitHub Actions │────────────────▶│     GHCR     │
+└──────────────┘               │   CI Pipeline  │   push (SHA)   │  (registry)  │
+                               └───────────────┘                 └──────┬───────┘
+                                                                        │
+                                                     terraform apply    │ docker pull
+                                                            │           ▼
+                                                            ▼    ┌──────────────┐
+                                                     ┌─────────┐ │  EC2 t3.micro│
+                                                     │Terraform│▶│  Docker Host │
+                                                     └─────────┘ │              │
+                                                                 │ ┌──────────┐ │
+                                                                 │ │ llm-api  │ │
+                                                                 │ │  :8000   │ │
+                                                                 │ └────┬─────┘ │
+                                                                 │      │llm-net│
+                                                                 │ ┌────▼─────┐ │
+                                                                 │ │  ollama  │ │
+                                                                 │ │  :11434  │ │
+                                                                 │ └──────────┘ │
+                                                                 └──────────────┘
+                                                                        │
+                                                              curl (public IP)
+                                                                        │
+                                                                        ▼
+                                                                Verified from
+                                                                local machine
+
+                                              terraform destroy (immediately after)
+                                                        │
+                                                        ▼
+                                              All resources terminated
+```
+
+### Budget Note
+Instance ran for the duration of one build-and-verify session only. `terraform destroy` confirmed 3/3 resources destroyed (`aws_instance`, `aws_key_pair`, `aws_security_group`) with no residual billing.
+
+---
