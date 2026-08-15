@@ -49,11 +49,11 @@ spec:
               name: http
           resources:
             requests:
-              cpu: "500m"
-              memory: "1Gi"
+              cpu: "250m"
+              memory: "512Mi"
             limits:
-              cpu: "2"
-              memory: "4Gi"
+              cpu: "1"
+              memory: "1.5Gi"
           volumeMounts:
             - name: ollama-storage
               mountPath: /root/.ollama

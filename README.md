@@ -559,3 +559,147 @@ curl -X POST http://43.204.228.127:8000/generate \
 Instance ran for the duration of one build-and-verify session only. `terraform destroy` confirmed 3/3 resources destroyed (`aws_instance`, `aws_key_pair`, `aws_security_group`) with no residual billing.
 
 ---
+---
+
+## Day 8: Cloud-Native Migration — EKS, IRSA & Production Kubernetes Friction
+
+### Accomplished
+- [x] Extended existing Terraform (not a rewrite) to provision a real EKS cluster:
+  - EKS control plane (Kubernetes 1.35, standard support)
+  - Managed node group (2x `t3.small`, Free Tier eligible)
+  - Dedicated cluster and node IAM roles
+  - EBS CSI driver add-on with proper IRSA binding
+  - OIDC provider for IAM Roles for Service Accounts (IRSA)
+- [x] Reapplied existing Kubernetes manifests from Days 2-6 (`k8s/`) onto real managed infrastructure with minimal changes, proving portability from local `kind`
+- [x] Created a `StorageClass` (`ebs-gp3`, set as default) to enable dynamic EBS-backed PVC provisioning
+- [x] Right-sized Ollama's memory `requests`/`limits` for real node capacity, replacing values inherited from an unconstrained local Docker environment
+- [x] Fixed image references and added a GHCR pull secret so the API deployment could actually pull its private image on a cluster with no pre-existing Docker credentials
+- [x] Verified full end-to-end request flow on real cloud infrastructure: `curl` → API pod → Kubernetes DNS → Ollama pod → response
+- [x] Confirmed complete teardown via `terraform destroy`, including a manual check for orphaned EBS volumes left behind by dynamic provisioning
+
+### Deployment & Verification Previews
+
+#### EKS End-to-End Endpoint Verification
+*Port-forwarded verification of `/health` and live `/generate` inference via Kubernetes DNS across real EKS pods (`ollama-service.llm-serving.svc.cluster.local:11434`):*
+![EKS Endpoint Verification](terraform/screenshots/eks_endpoint_verification.png)
+
+#### EKS Node Capacity & Pod Allocation
+*AWS EKS console overview of `t3.small` worker node capacity allocation (CPU, memory reservations) and running workload pods:*
+![EKS Node Capacity Allocation](terraform/screenshots/eks_node_capacity_allocation.png)
+
+#### AWS EKS Node & Kubelet Lifecycle Events
+*Kubelet registration, allocatable limits enforcement, readiness, and scheduling event stream on the provisioned EKS node:*
+![EKS Node Events](terraform/screenshots/eks_node_events.png)
+
+### Architectural Rationale & Design Patterns
+- **Extend existing Terraform rather than start a new module**: the EKS resources (cluster, node group, IAM, IRSA, addon) were added directly into the same `main.tf` used for earlier infrastructure, keeping one source of truth for the project's cloud footprint rather than fragmenting IaC across multiple untracked configurations.
+- **Free Tier-eligible node sizing, deliberately verified rather than assumed**: `t3.small` was chosen only after confirming via `aws ec2 describe-instance-types --filters "Name=free-tier-eligible,Values=true"` that it was genuinely eligible on this account — not assumed from general AWS documentation, which can lag actual account-level enforcement.
+- **IRSA over node-role IAM for the CSI driver**: the EBS CSI controller calls AWS APIs directly (CreateVolume, AttachVolume, etc.) and is scoped its own dedicated IAM role bound via OIDC/IRSA to its specific Kubernetes service account, rather than inheriting broad permissions from the underlying EC2 node's role. This follows the principle of least privilege that's specifically expected on production EKS clusters, and is different from how the simpler Day 7 EC2/Docker setup handled permissions.
+- **Manifest portability as the actual point of the exercise**: the Kubernetes objects themselves (Deployments, Services, PVCs) required almost no changes between `kind` and EKS — the friction was entirely in the surrounding cloud plumbing (IAM, storage classes, image registries, resource sizing), which is the realistic split between "Kubernetes knowledge" and "cloud operations knowledge."
+- **Right-sizing resource requests per environment, not copy-pasting them**: Ollama's `1Gi` memory request, fine on a local machine with abundant free RAM, was tight enough on a real `2GB` node (after system/CNI/CSI overhead) to block scheduling entirely. This is treated as a deliberate lesson, not a bug — manifests written for one environment carry implicit assumptions that don't automatically hold in another.
+
+### Debugging Log
+
+**1. EKS cluster created with an end-of-support Kubernetes version**
+- Symptom: console flagged "Kubernetes version no longer supported by Amazon EKS" immediately after cluster creation.
+- Root cause: `main.tf` had `version = "1.30"` hardcoded, which had aged out of EKS's standard support window by the time of provisioning.
+- Fix: destroyed the just-created control plane immediately (cheap at this stage — no node group yet) and reprovisioned with `version = "1.35"`, confirmed via the console to carry standard support until March 2027.
+
+**2. Node group launch failure — `AsgInstanceLaunchFailures: InvalidParameterCombination`**
+- Symptom: node group sat in `CREATING` for over 30 minutes with an empty `health.issues` array, giving no early signal anything was wrong. AWS CLI checks (`describe-nodegroup`, `describe-instances`) showed zero EC2 instances had even launched.
+- Root cause: `t3.medium`, the originally configured instance type, is not Free Tier-eligible on this account. The ASG silently failed to launch any instances rather than erroring immediately.
+- Fix: switched to `t3.small`, confirmed Free Tier-eligible via `describe-instance-types`, node group succeeded in under 2 minutes.
+- Lesson: EKS node group failures don't always surface fast — the AWS console's "Health issues" tab found the root cause instantly, faster than digging through Terraform/CLI output. Check the console first on unexplained multi-minute hangs.
+
+**3. Stale Terraform state lock after an interrupted `apply`**
+- Symptom: `Error acquiring the state lock` blocking all further Terraform commands.
+- Root cause: an earlier `apply` had been killed mid-operation (in response to the node group hang above), leaving a lock that the local backend couldn't automatically release, and `terraform force-unlock` itself failed with `"Local state cannot be unlocked by another process"` despite no live process actually holding the file.
+- Fix: verified via `lsof`/`fuser` that nothing was genuinely holding the state file, then proceeded with `-lock=false` for a one-time, deliberately-scoped bypass — acceptable here specifically because concurrent access had already been ruled out, not a general practice.
+- Lesson: local Terraform state plus interrupted operations is a known solo-development pain point; remote state with proper locking (S3 + DynamoDB) exists specifically to handle this more gracefully.
+
+**4. EBS CSI controller pods `CrashLoopBackOff` with HTTP 500 on liveness probe**
+- Symptom: node-plugin CSI pods (local, no AWS API calls) ran fine; controller pods (which call AWS APIs like `CreateVolume`) failed to become healthy, cycling through all sidecar containers restarting repeatedly.
+- Root cause: the node IAM role had `AmazonEBSCSIDriverPolicy` attached, but the CSI *controller* pod doesn't inherit node-level IAM by default on modern EKS — it requires its own dedicated IAM role bound to its specific Kubernetes service account via IRSA (IAM Roles for Service Accounts), which requires an OIDC identity provider to exist for the cluster.
+- Fix: added `aws_iam_openid_connect_provider`, a dedicated `aws_iam_role.ebs_csi_irsa` trusted only by `system:serviceaccount:kube-system:ebs-csi-controller-sa`, and pointed the addon at it via `service_account_role_arn`.
+- Complication: updating `service_account_role_arn` on an *already-existing* addon (created without IRSA) hung for the full 20-minute AWS provider timeout without completing. Recreating the addon fresh (`tainted`, forced replace) with IRSA specified from creation resolved it in under a minute — suggesting in-place IRSA retrofits on EKS addons are a rough edge worth avoiding when possible.
+
+**5. PVC stuck `Pending` — no default StorageClass**
+- Symptom: even after the CSI driver was healthy, `ollama-pvc` remained unbound.
+- Root cause: `kind` provided `local-path-storage` as a default StorageClass automatically; EKS provides no default at all out of the box. The CSI driver being healthy doesn't create a StorageClass — that's a separate, explicit step.
+- Fix: created `k8s/storageclass.yaml` (`ebs-gp3`, `provisioner: ebs.csi.aws.com`, marked `is-default-class: true`), which unblocked binding immediately once a pod requiring it was scheduled (`WaitForFirstConsumer` binding mode).
+
+**6. Ollama pod `Pending` — insufficient memory**
+- Symptom: after the PVC issue resolved, scheduling failed with `Insufficient memory` across both nodes.
+- Root cause: Ollama's deployment requested `1Gi` memory, a value carried over from local `kind` (effectively unconstrained RAM via Docker Desktop). On real `t3.small` nodes (2GB total, meaningfully less after system/CNI/CSI overhead), that request didn't fit alongside what was already committed ([`terraform/screenshots/eks_node_capacity_allocation.png`](file:///home/yash55-max/projects/llm-devops/terraform/screenshots/eks_node_capacity_allocation.png)).
+- Fix: lowered the request to `512Mi` (limit kept generous at `1.5Gi`) — comfortably sufficient for a 0.5B-parameter quantized model, and the pod scheduled immediately.
+
+**7. API pod `ImagePullBackOff` — missing registry prefix, then missing pull secret**
+- Symptom: kubelet reported pull failures against `docker.io/library/llm-api:day5` — a Docker Hub path that was never the actual image location.
+- Root cause: the manifest's `image:` field had no registry prefix at all, a gap invisible on `kind` because the image had been `kind load docker-image`'d locally and never needed to resolve a real registry path.
+- Fix: corrected the reference to `ghcr.io/yash55-max/llm-devops:9f254a0` (verified locally via `docker pull` first), then created a `ghcr-secret` (`kubectl create secret docker-registry`) and added `imagePullSecrets` to the deployment, since the private GHCR package still required authentication even with the correct path.
+
+**8. Service `targetPort` didn't match the container's actual listening port**
+- Symptom: `kubectl port-forward` succeeded at the network level but every request returned "connection refused" from inside the pod's network namespace.
+- Root cause: `api-service.yaml`'s `targetPort` was `8001`, left over from a fix applied directly to a *previous* live cluster's state on Day 6, but never corrected in the source-controlled YAML itself — so the drift resurfaced identically on this fresh cluster.
+- Fix: corrected both `port` and `targetPort` to `8000`, matching the container's actual `EXPOSE`/`uvicorn --port` value.
+- Lesson: fixing a live cluster's resource without updating the tracked manifest just defers the same bug to the next `kubectl apply -f` — worth treating "fix applied" and "fix committed to source" as two separate, both-required steps.
+
+**Takeaway**: today's failures were almost entirely EKS-specific gaps that `kind` had been silently covering for — default storage classes, IRSA-based AWS API auth, real per-node resource accounting, and registry resolution. None of these are Kubernetes problems in the abstract; they're the concrete difference between "runs a manifest" and "operates managed cloud Kubernetes," which is precisely the distinction this project is meant to demonstrate.
+
+### Verified End-to-End (Real EKS Cluster)
+*Live endpoint and inference verification on EKS ([`terraform/screenshots/eks_endpoint_verification.png`](file:///home/yash55-max/projects/llm-devops/terraform/screenshots/eks_endpoint_verification.png)):*
+```bash
+curl http://localhost:8080/health
+# {"status":"ok","ollama_host":"http://ollama-service.llm-serving.svc.cluster.local:11434"}
+
+curl -X POST http://localhost:8080/generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Explain Kubernetes in one sentence."}'
+# {"model":"qwen2.5:0.5b","response":"Kubernetes is an open-source platform for
+#  containerized applications that automate the deployment, scaling, and management
+#  of containerized applications.","done":true}
+```
+
+### EKS Architecture
+```text
+                              AWS (ap-south-1)
+┌───────────────────────────────────────────────────────────────────────┐
+│  VPC (10.0.0.0/16)                                                     │
+│  ┌─────────────────┐         ┌─────────────────┐                      │
+│  │  Public Subnet 1 │         │  Public Subnet 2 │                      │
+│  │  (ap-south-1a)   │         │  (ap-south-1b)   │                      │
+│  └────────┬─────────┘         └────────┬─────────┘                      │
+│           │                            │                                │
+│  ┌────────▼────────────────────────────▼─────────┐                      │
+│  │            EKS Control Plane (v1.35)           │                      │
+│  └────────┬────────────────────────────┬──────────┘                      │
+│           │                            │                                │
+│  ┌────────▼─────────┐         ┌────────▼─────────┐                      │
+│  │  t3.small node 1  │         │  t3.small node 2  │                      │
+│  │  ┌──────────────┐ │         │  ┌──────────────┐ │                      │
+│  │  │  llm-api pod │ │         │  │  ollama pod  │ │                      │
+│  │  │    :8000     │◄┼─────────┼─▶│    :11434    │ │                      │
+│  │  └──────────────┘ │  DNS    │  └──────┬───────┘ │                      │
+│  │  ┌──────────────┐ │         │         │ PVC     │                      │
+│  │  │ EBS CSI (IRSA)│ │         │  ┌──────▼───────┐ │                      │
+│  │  └──────────────┘ │         │  │ EBS gp3 vol  │ │                      │
+│  └───────────────────┘         │  └──────────────┘ │                      │
+│                                 └───────────────────┘                      │
+└───────────────────────────────────────────────────────────────────────┘
+         ▲
+         │ OIDC / IRSA trust
+         │
+┌────────┴─────────┐
+│  IAM: ebs-csi-irsa│  (scoped to system:serviceaccount:kube-system:ebs-csi-controller-sa)
+└───────────────────┘
+```
+
+### Budget & Cleanup
+Full teardown via `terraform destroy` after verification. Dynamically-provisioned EBS volumes (created by the CSI driver via PVC, not directly by Terraform) were checked separately post-destroy to rule out orphaned billing:
+```bash
+aws ec2 describe-volumes --region ap-south-1 \
+  --filters "Name=status,Values=available" \
+  --query 'Volumes[].{ID:VolumeId,Size:Size,Created:CreateTime}'
+```
+
+---

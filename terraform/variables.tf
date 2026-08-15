@@ -1,17 +1,17 @@
 variable "aws_region" {
-  description = "AWS Region to deploy resources"
+  description = "AWS region for deployment"
   type        = string
   default     = "ap-south-1"
 }
 
-variable "instance_type" {
-  description = "EC2 instance type"
+variable "cluster_name" {
+  description = "EKS Cluster Name"
   type        = string
-  default     = "t3.micro"   # or "t3.micro"
+  default     = "devops-ai-eks"
 }
 
-variable "public_key_path" {
-  description = "Path to the public SSH key"
+variable "node_instance_type" {
+  description = "EC2 Instance type for the managed node group"
   type        = string
-  default     = "~/.ssh/llm_ec2_key.pub"
+  default     = "t3.small"
 }

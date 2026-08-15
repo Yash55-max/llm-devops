@@ -12,38 +12,39 @@ spec:
       app: llm-api
   template:
     metadata:
-
       labels:
         app: llm-api
     spec:
+      imagePullSecrets:
+        - name: ghcr-secret
       containers:
-      - name: llm-api
-        image: llm-api:day5
-        imagePullPolicy: IfNotPresent
-        ports:
-        - containerPort: 8000
-        env:
-        # Kubernetes In-Cluster DNS endpoint for the Ollama Service
-        - name: OLLAMA_HOST
-          value: "http://ollama-service.llm-serving.svc.cluster.local:11434"
-        - name: MODEL_NAME
-          value: "qwen2.5:0.5b"
-        resources:
-          requests:
-            cpu: "100m"
-            memory: "128Mi"
-          limits:
-            cpu: "500m"
-            memory: "512Mi"
-        livenessProbe:
-          httpGet:
-            path: /health
-            port: 8000
-          initialDelaySeconds: 5
-          periodSeconds: 10
-        readinessProbe:
-          httpGet:
-            path: /health
-            port: 8000
-          initialDelaySeconds: 5
-          periodSeconds: 10
+        - name: llm-api
+          image: ghcr.io/yash55-max/llm-devops:9f254a0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          env:
+            # Kubernetes In-Cluster DNS endpoint for the Ollama Service
+            - name: OLLAMA_HOST
+              value: "http://ollama-service.llm-serving.svc.cluster.local:11434"
+            - name: MODEL_NAME
+              value: "qwen2.5:0.5b"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10

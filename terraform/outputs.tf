@@ -1,9 +1,14 @@
-output "instance_public_ip" {
-  description = "Public IP address of the EC2 instance"
-  value       = aws_instance.llm_node.public_ip
+output "cluster_name" {
+  description = "EKS Cluster Name"
+  value       = aws_eks_cluster.main.name
 }
 
-output "ssh_command" {
-  description = "Command to SSH directly into the instance"
-  value       = "ssh -i ~/.ssh/llm_ec2_key ubuntu@${aws_instance.llm_node.public_ip}"
+output "cluster_endpoint" {
+  description = "EKS Control Plane Endpoint"
+  value       = aws_eks_cluster.main.endpoint
+}
+
+output "kubeconfig_cmd" {
+  description = "Command to authenticate kubectl with the EKS cluster"
+  value       = "aws eks update-kubeconfig --region ${var.aws_region} --name${aws_eks_cluster.main.name}"
 }
