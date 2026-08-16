@@ -703,3 +703,159 @@ aws ec2 describe-volumes --region ap-south-1 \
 ```
 
 ---
+---
+
+## Day 9: Observability on EKS, Public Exposure & Cross-Environment Validation
+
+### Accomplished
+- [x] Recreated EKS cluster from Terraform after full Day 8 teardown — validated that IaC alone reliably reproduces the entire environment (cluster, node group, IRSA, EBS CSI, StorageClass) with zero manual intervention
+- [x] Installed `kube-prometheus-stack` via Helm on real EKS infrastructure, with resource requests pre-sized from Day 8's memory-sizing lesson
+- [x] Reapplied `ServiceMonitor` and `PrometheusRule` manifests deferred from Day 8 — succeeded immediately now that CRDs exist, with the `release: prometheus-stack` label already correctly baked into the YAML from earlier fixes
+- [x] Re-imported the golden-signals Grafana dashboard from its saved JSON export onto a completely fresh cluster, validating the dashboard-as-code discipline established on Day 5
+- [x] Exposed the API via a genuine AWS Classic Load Balancer (`type: LoadBalancer`), replacing `NodePort`/port-forward with a real public endpoint
+- [x] Verified the full request path end-to-end over the public internet: DNS → ELB → Service → pod → Ollama → response
+- [x] Triggered and confirmed a real `HighErrorRate` alert firing through the public endpoint (not port-forward), observed live in both Prometheus and the Grafana dashboard simultaneously
+- [x] Diagnosed a genuine multi-AZ EBS/PVC scheduling constraint during recovery testing
+- [x] Full teardown: LoadBalancer Service deleted first (clean ELB deprovisioning), followed by `terraform destroy`, followed by manual orphan checks
+
+### Observability & Infrastructure Previews
+
+#### EKS Golden Signals Dashboard & Monitoring Stack
+*Re-imported Golden Signals Grafana dashboard running on real EKS infrastructure, with the `kube-prometheus-stack` components (Prometheus Operator, Alertmanager, Node Exporter, Kube State Metrics, Grafana) healthy in the `monitoring` namespace:*
+![EKS Golden Signals Dashboard](monitoring/dashboards/eks_golden_signals_dashboard.png)
+
+#### AWS Classic Load Balancer Public Endpoint Verification
+*Live endpoint verification over the public AWS Classic ELB hostname (`*.ap-south-1.elb.amazonaws.com:8000`), testing `/health` and prompt inference against the LLM serving stack over the public internet:*
+![AWS Classic ELB Public Verification](monitoring/dashboards/eks_elb_public_endpoint_verification.png)
+
+#### Prometheus Alert Lifecycle: Firing on Real Cloud Infra
+*Prometheus alerting rule `HighErrorRate` transitioning to FIRING (1) during live fault injection (Ollama scaled to zero while curling the public ELB):*
+![Prometheus Alert Firing](monitoring/dashboards/eks_prometheus_alert_firing.png)
+
+#### Synchronized Golden Signals Incident Metrics (Grafana)
+*Grafana Golden Signals dashboard reflecting real-time metric surges (Requests rate, P95 latency spike, and Error rate spike) in perfect synchronization with the public ELB fault injection:*
+![Grafana Incident Metrics Spikes](monitoring/dashboards/eks_grafana_incident_metrics.png)
+
+#### AWS Console Workload Pods Overview
+*AWS EKS console workloads view confirming all 7 pods running across namespaces (`kube-system`, `llm-serving`, `monitoring`):*
+![AWS EKS Console Workloads](monitoring/dashboards/eks_console_workload_pods.png)
+
+### Architectural Rationale & Design Patterns
+- **IaC reproducibility as a first-class test, not an assumption**: recreating the entire cluster from a full teardown, on a new day, with zero manual fixes needed beyond reapplying Kubernetes-level manifests (namespace, secrets, storage class — none of which are Terraform-managed by design), is the actual proof that the Day 7-8 Terraform work is correct and complete, not just "worked once."
+- **Pre-sizing resource requests from prior lessons**: Prometheus/Grafana/Alertmanager Helm values were set with sensible request/limit values from the start today, directly informed by Day 8's Ollama memory-sizing incident — proactive engineering based on a documented prior failure, rather than repeating the same discovery process.
+- **Classic ELB via default `type: LoadBalancer`, not ALB/NLB**: the in-tree AWS cloud provider provisions a Classic Load Balancer by default for this Service type — a legacy AWS product, chosen here for simplicity and zero extra components. Production setups typically install the AWS Load Balancer Controller add-on to get modern NLB/ALB behavior (faster provisioning, more routing features, lower cost) — noted as a deliberate scope decision, not an oversight.
+- **Deleting the Service before `terraform destroy`, not after**: `kubectl delete svc` on a `LoadBalancer`-type Service triggers Kubernetes' own cloud-provider integration to deprovision the underlying ELB cleanly. Since Terraform never created that ELB directly (Kubernetes did, via the Service controller), running `terraform destroy` first would leave it orphaned and billing indefinitely.
+
+### Debugging Log
+
+**1. Leaked credential in terminal output**
+- A live GitHub Personal Access Token was pasted in plaintext during a `kubectl create secret` command.
+- Immediately treated as compromised: revoked via GitHub settings and replaced with a new token. No token value is stored in any tracked file — `github-pat.txt` exists locally only and is `.gitignore`-excluded.
+- Noted here as a reminder that command history, shared terminals, and chat interfaces are all credential-leak vectors equally worth guarding against, not just committed files.
+
+**2. Grafana pod stuck `2/3 Running`, blank page in browser**
+- Symptom: `kubectl port-forward` tunnel stayed alive and actively handled connections, but the browser rendered nothing. Logs showed repeated `SQLITE_BUSY` database-lock retries and a 138-second timeout (504) on a dashboard API call.
+- Root cause: Grafana's startup sequence on this Helm install includes downloading and registering several bundled plugins (`grafana-pyroscope-app`, `grafana-exploretraces-app`, `grafana-metricsdrilldown-app`, `zipkin`) — meaningfully more startup work than the local `kind` install ever performed — and the initial `200m` CPU limit throttled the main `grafana` container badly enough that it couldn't finish initializing within a reasonable window.
+- Fix: `helm upgrade` with `grafana.resources.limits.cpu` raised to `750m`. New pod reached `3/3 Running` promptly ([`monitoring/dashboards/eks_golden_signals_dashboard.png`](file:///home/yash55-max/projects/llm-devops/monitoring/dashboards/eks_golden_signals_dashboard.png)); the original pod also self-recovered once resource pressure eased.
+- Lesson: this is the same category of issue as Day 8's Ollama memory sizing — values inherited from a resource-unconstrained local environment don't automatically hold on real infrastructure, and CPU throttling during startup can produce symptoms (blank page, timeouts) that look like a networking or configuration bug rather than a resource one.
+
+**3. ELB DNS name unresolvable immediately after provisioning**
+- Symptom: `curl` and `nslookup` (even against `8.8.8.8`) returned `NXDOMAIN` for several minutes after `kubectl get svc` showed a populated `EXTERNAL-IP` hostname, despite `kubectl describe svc` confirming `EnsuredLoadBalancer` and the AWS `elb describe-load-balancers` API confirming the load balancer existed and was addressable.
+- Root cause: standard DNS propagation delay for a freshly created Classic ELB — the infrastructure was correct and complete from the moment `EnsuredLoadBalancer` fired; only public DNS resolution lagged behind.
+- Resolution: no fix needed — waited roughly 10-13 minutes total, then `nslookup` against `8.8.8.8` returned two valid A records, and the endpoint worked immediately after.
+- Lesson: distinguish "infrastructure is wrong" from "infrastructure is right but not yet visible" before making changes — `kubectl describe svc` and the AWS-side API were the correct sources of truth here, not the DNS resolution symptom.
+
+**4. PVC/pod scheduling blocked by cross-AZ EBS affinity after Ollama pod recreation**
+- Symptom: after scaling Ollama back up post-alert-test, the new pod stayed `Pending` with `FailedScheduling`: one node had insufficient memory, and the *other* node — which had free memory — was rejected due to "PersistentVolume's node affinity" mismatch ([`monitoring/dashboards/eks_console_workload_pods.png`](file:///home/yash55-max/projects/llm-devops/monitoring/dashboards/eks_console_workload_pods.png)).
+- Root cause: EBS volumes are zone-locked at creation. The existing `ollama-pvc`'s underlying volume lived in `ap-south-1a`; the node with available memory was in `ap-south-1b`. A pod requiring that specific PVC structurally cannot schedule outside the volume's zone, regardless of other resource availability.
+- Resolution: not fixed today — deliberately deprioritized since it didn't block any remaining Day 9 goal (public endpoint and alert-firing tests were already completed and captured before this occurred), and the cluster was being torn down shortly after regardless.
+- Lesson for future work: single-replica stateful workloads on multi-AZ EKS node groups are inherently exposed to this failure mode. Production mitigations include pinning node groups to a single AZ for simple stateful workloads, using EBS multi-attach where supported, or moving to a StatefulSet with per-AZ topology awareness for anything requiring real resilience.
+
+**Takeaway**: today's issues split cleanly into two categories — problems fully solved (Grafana resource sizing, DNS propagation patience) and one problem correctly diagnosed but deliberately left unresolved due to time/priority tradeoffs, with the reasoning documented rather than silently ignored. Recognizing when *not* to chase a fix is as much a part of real operations work as fixing things.
+
+### Verified Public Endpoint (Real AWS Classic ELB)
+*Live endpoint and inference verification via public AWS Classic Load Balancer ([`monitoring/dashboards/eks_elb_public_endpoint_verification.png`](file:///home/yash55-max/projects/llm-devops/monitoring/dashboards/eks_elb_public_endpoint_verification.png)):*
+```bash
+curl http://a8931d61cc54f4205beb65058c6ebfc5-1730394859.ap-south-1.elb.amazonaws.com:8000/health
+# {"status":"ok","ollama_host":"http://ollama-service.llm-serving.svc.cluster.local:11434"}
+
+curl -X POST http://a8931d61cc54f4205beb65058c6ebfc5-1730394859.ap-south-1.elb.amazonaws.com:8000/generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Explain load balancers in one sentence."}'
+# {"model":"qwen2.5:0.5b","response":"A load balancer is a type of network service
+#  that distributes traffic evenly across multiple servers or instances, enabling the
+#  server or instance to handle an increasing number of concurrent connections while
+#  minimizing the impact of a single server or instance failure.","done":true}
+```
+
+### Incident Lifecycle — Verified Through the Public Endpoint
+*Live fault injection and alert verification across Prometheus and Grafana ([`monitoring/dashboards/eks_prometheus_alert_firing.png`](file:///home/yash55-max/projects/llm-devops/monitoring/dashboards/eks_prometheus_alert_firing.png) and [`monitoring/dashboards/eks_grafana_incident_metrics.png`](file:///home/yash55-max/projects/llm-devops/monitoring/dashboards/eks_grafana_incident_metrics.png)):*
+```text
+ 1. Baseline            All alerts Inactive, dashboard flat
+         │
+         ▼
+ 2. Fault injected       kubectl scale deployment ollama-deployment --replicas=0
+         │
+         ▼
+ 3. Load via public ELB  curl loop against the real internet-facing endpoint
+         │
+         ▼
+ 4. App returns 503s     httpx.ConnectError handler (unchanged since Day 3)
+         │
+         ▼
+ 5. HighErrorRate fires  Inactive → Pending → FIRING(1), visible in Prometheus
+         │
+         ▼
+ 6. Dashboard confirms   Error rate panel spikes in sync, Grafana + Prometheus agree
+         │
+         ▼
+ 7. Fault resolved       kubectl scale deployment ollama-deployment --replicas=1
+```
+
+### End-to-End Architecture (Day 9 State)
+```text
+                         Public Internet
+                                │
+                                │ curl (real DNS)
+                                ▼
+                  ┌─────────────────────────┐
+                  │  AWS Classic ELB         │
+                  │  *.elb.amazonaws.com     │
+                  └────────────┬─────────────┘
+                                │
+                  AWS (EKS, ap-south-1)
+┌───────────────────────────────┼───────────────────────────────┐
+│                                ▼                                │
+│  ┌──────────────┐    ┌──────────────┐                          │
+│  │  llm-api pod  │───▶│  ollama pod  │                          │
+│  │    :8000      │DNS │   :11434     │                          │
+│  └───────┬───────┘    └───────┬──────┘                          │
+│          │ /metrics           │ EBS PVC                          │
+│          ▼                    ▼                                 │
+│  ┌──────────────────────────────────┐                           │
+│  │      Prometheus (scrape)         │                           │
+│  └────────────┬──────────┬──────────┘                           │
+│               │          │                                       │
+│               ▼          ▼                                       │
+│      ┌──────────────┐ ┌──────────────┐                          │
+│      │  Alertmanager │ │   Grafana    │                          │
+│      └──────────────┘ └──────────────┘                          │
+└───────────────────────────────────────────────────────────────┘
+```
+
+### Budget & Cleanup
+Teardown order enforced deliberately: `kubectl delete svc` (ELB deprovision) → `terraform destroy` → manual orphan verification.
+```bash
+kubectl delete svc llm-api-service -n llm-serving
+aws elb describe-load-balancers --region ap-south-1 --query 'LoadBalancerDescriptions[].LoadBalancerName'
+# []
+
+terraform destroy -auto-approve
+
+aws ec2 describe-volumes --region ap-south-1 --filters "Name=status,Values=available" --query 'Volumes[].VolumeId'
+# []
+aws elb describe-load-balancers --region ap-south-1 --query 'LoadBalancerDescriptions[].LoadBalancerName'
+# []
+```
+
+---

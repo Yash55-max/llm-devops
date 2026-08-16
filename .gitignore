@@ -1,6 +1,8 @@
 .terraform/
 *.tfstate
 *.tfstate.backup
+*.tfstate.lock.info
+.terraform.tfstate.lock.info
 *.pem
 *.key
 .env
@@ -9,3 +11,4 @@ aws/
 __pycache__/
 *.pyc
 commands.txt
+github-pat.txt

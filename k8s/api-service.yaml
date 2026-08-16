@@ -6,11 +6,10 @@ metadata:
   labels:
     app: llm-api
 spec:
-  type: NodePort
+  type: LoadBalancer
   ports:
     - port: 8000
       targetPort: 8000
-      nodePort: 30080
       name: http
   selector:
     app: llm-api
