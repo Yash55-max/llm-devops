@@ -748,24 +748,19 @@ aws ec2 describe-volumes --region ap-south-1 \
 
 ### Debugging Log
 
-**1. Leaked credential in terminal output**
-- A live GitHub Personal Access Token was pasted in plaintext during a `kubectl create secret` command.
-- Immediately treated as compromised: revoked via GitHub settings and replaced with a new token. No token value is stored in any tracked file — `github-pat.txt` exists locally only and is `.gitignore`-excluded.
-- Noted here as a reminder that command history, shared terminals, and chat interfaces are all credential-leak vectors equally worth guarding against, not just committed files.
-
-**2. Grafana pod stuck `2/3 Running`, blank page in browser**
+**1. Grafana pod stuck `2/3 Running`, blank page in browser**
 - Symptom: `kubectl port-forward` tunnel stayed alive and actively handled connections, but the browser rendered nothing. Logs showed repeated `SQLITE_BUSY` database-lock retries and a 138-second timeout (504) on a dashboard API call.
 - Root cause: Grafana's startup sequence on this Helm install includes downloading and registering several bundled plugins (`grafana-pyroscope-app`, `grafana-exploretraces-app`, `grafana-metricsdrilldown-app`, `zipkin`) — meaningfully more startup work than the local `kind` install ever performed — and the initial `200m` CPU limit throttled the main `grafana` container badly enough that it couldn't finish initializing within a reasonable window.
 - Fix: `helm upgrade` with `grafana.resources.limits.cpu` raised to `750m`. New pod reached `3/3 Running` promptly ([`monitoring/dashboards/eks_golden_signals_dashboard.png`](file:///home/yash55-max/projects/llm-devops/monitoring/dashboards/eks_golden_signals_dashboard.png)); the original pod also self-recovered once resource pressure eased.
 - Lesson: this is the same category of issue as Day 8's Ollama memory sizing — values inherited from a resource-unconstrained local environment don't automatically hold on real infrastructure, and CPU throttling during startup can produce symptoms (blank page, timeouts) that look like a networking or configuration bug rather than a resource one.
 
-**3. ELB DNS name unresolvable immediately after provisioning**
+**2. ELB DNS name unresolvable immediately after provisioning**
 - Symptom: `curl` and `nslookup` (even against `8.8.8.8`) returned `NXDOMAIN` for several minutes after `kubectl get svc` showed a populated `EXTERNAL-IP` hostname, despite `kubectl describe svc` confirming `EnsuredLoadBalancer` and the AWS `elb describe-load-balancers` API confirming the load balancer existed and was addressable.
 - Root cause: standard DNS propagation delay for a freshly created Classic ELB — the infrastructure was correct and complete from the moment `EnsuredLoadBalancer` fired; only public DNS resolution lagged behind.
 - Resolution: no fix needed — waited roughly 10-13 minutes total, then `nslookup` against `8.8.8.8` returned two valid A records, and the endpoint worked immediately after.
 - Lesson: distinguish "infrastructure is wrong" from "infrastructure is right but not yet visible" before making changes — `kubectl describe svc` and the AWS-side API were the correct sources of truth here, not the DNS resolution symptom.
 
-**4. PVC/pod scheduling blocked by cross-AZ EBS affinity after Ollama pod recreation**
+**3. PVC/pod scheduling blocked by cross-AZ EBS affinity after Ollama pod recreation**
 - Symptom: after scaling Ollama back up post-alert-test, the new pod stayed `Pending` with `FailedScheduling`: one node had insufficient memory, and the *other* node — which had free memory — was rejected due to "PersistentVolume's node affinity" mismatch ([`monitoring/dashboards/eks_console_workload_pods.png`](file:///home/yash55-max/projects/llm-devops/monitoring/dashboards/eks_console_workload_pods.png)).
 - Root cause: EBS volumes are zone-locked at creation. The existing `ollama-pvc`'s underlying volume lived in `ap-south-1a`; the node with available memory was in `ap-south-1b`. A pod requiring that specific PVC structurally cannot schedule outside the volume's zone, regardless of other resource availability.
 - Resolution: not fixed today — deliberately deprioritized since it didn't block any remaining Day 9 goal (public endpoint and alert-firing tests were already completed and captured before this occurred), and the cluster was being torn down shortly after regardless.
