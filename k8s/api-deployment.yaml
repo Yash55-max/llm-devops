@@ -19,7 +19,7 @@ spec:
         - name: ghcr-secret
       containers:
         - name: llm-api
-          image: ghcr.io/yash55-max/llm-devops:9f254a0
+          image: ghcr.io/Yash55-max/llm-devops:latest
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8000
