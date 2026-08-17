@@ -37,6 +37,8 @@ jobs:
           ruff check .
 
       - name: Run Pytest
+        env:
+          PYTHONPATH: .
         run: |
           python -m pytest -v
 
@@ -46,6 +48,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      image_tag: ${{ steps.meta.outputs.version }}
 
     steps:
       - name: Checkout repository
@@ -75,3 +79,39 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+  deploy:
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update Deployment Image Tag (GitOps Sync)
+        run: |
+          IMAGE_TAG="${{ needs.build-and-push.outputs.image_tag }}"
+          NEW_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${IMAGE_TAG}"
+          echo "Updating deployment manifest with image: ${NEW_IMAGE}"
+
+          # Patch image in deployment manifest
+          sed -i "s|image: ghcr.io/.*|image: ${NEW_IMAGE}|g" k8s/api-deployment.yaml
+
+      - name: Commit and Push Manifest Changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add k8s/api-deployment.yaml
+
+          # Only commit if the manifest tag actually changed
+          if git diff --staged --quiet; then
+            echo "No changes in deployment manifest."
+          else
+            git commit -m "chore(cd): update api image tag to ${{ needs.build-and-push.outputs.image_tag }} [skip ci]"
+            git push origin main
+          fi

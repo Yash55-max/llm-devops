@@ -1,87 +1,261 @@
-# LLM Infrastructure & MLOps Platform
+# Production-Grade LLM Infrastructure & MLOps Platform
 
-End-to-end Kubernetes-based deployment platform for serving Open-Source LLMs with automated CI/CD, IaC, and Observability.
+An end-to-end cloud-native platform for containerized LLM inference serving, automated CI/CD pipelines, Infrastructure as Code (Terraform), and full-stack Kubernetes observability on AWS EKS.
 
 ---
 
-## Day 1: Infrastructure & Local Environment Baseline
+## Table of Contents
 
-### Accomplished
+- [Executive Project Summary](#executive-project-summary)
+- [Production Architecture](#production-architecture)
+- [Core Production Highlights](#core-production-highlights)
+- [Technology Stack](#technology-stack)
+- [Key Engineering Decisions and Tradeoffs](#key-engineering-decisions-and-tradeoffs)
+  - [1. Free Tier Resource Optimization and Capacity Planning](#1-free-tier-resource-optimization-and-capacity-planning)
+  - [2. IAM Roles for Service Accounts (IRSA) vs. Node-Level IAM](#2-iam-roles-for-service-accounts-irsa-vs-node-level-iam)
+  - [3. AWS EBS Multi-AZ Volume Affinity and Topology Constraints](#3-aws-ebs-multi-az-volume-affinity-and-topology-constraints)
+  - [4. Strict Teardown Discipline and Cloud Cost Guardrails](#4-strict-teardown-discipline-and-cloud-cost-guardrails)
+- [9-Day Implementation Milestone Summary](#9-day-implementation-milestone-summary)
+- [Detailed Day-by-Day Engineering and Debugging Logs](#detailed-day-by-day-engineering-and-debugging-logs)
+  - [Day 1: Infrastructure and Local Environment Baseline](#day-1-infrastructure-and-local-environment-baseline)
+  - [Day 2: Containerized Ollama Deployment into kind](#day-2-containerized-ollama-deployment-into-kind)
+  - [Day 3: Kubernetes Service Discovery and FastAPI Integration](#day-3-kubernetes-service-discovery-and-fastapi-integration)
+  - [Day 4: Automated CI/CD Pipeline and Container Registry Integration](#day-4-automated-cicd-pipeline-and-container-registry-integration)
+  - [Day 5: Observability Stack — Prometheus, Grafana and Golden Signals Dashboard](#day-5-observability-stack-prometheus-grafana-and-golden-signals-dashboard)
+  - [Day 6: Alerting — Alertmanager, PrometheusRule and Incident Lifecycle Validation](#day-6-alerting-alertmanager-prometheusrule-and-incident-lifecycle-validation)
+  - [Day 7: Cloud Migration — AWS EC2 via Terraform](#day-7-cloud-migration-aws-ec2-via-terraform)
+  - [Day 8: Cloud-Native Migration — EKS, IRSA and Production Kubernetes Friction](#day-8-cloud-native-migration-eks-irsa-and-production-kubernetes-friction)
+  - [Day 9: Observability on EKS, Public Exposure and Cross-Environment Validation](#day-9-observability-on-eks-public-exposure-and-cross-environment-validation)
+- [Repository Structure](#repository-structure)
+- [Quickstart and Reproduction Guide](#quickstart-and-reproduction-guide)
 
-- [x] AWS Billing Guardrails configured with 10 alert caps
-- [x] AWS CLI v2 configured with non-root IAM user (`yash-IAM-Admin`)
-- [x] Local toolchain verified:
-  - Docker v29
-  - kubectl v1.36
-  - kind v0.22
-  - Terraform v1.15
-- [x] Local 2-node Kubernetes cluster created using `kind`
-  - Cluster: `devops-ai-cluster`
-- [x] Ollama local model serving verified
+---
 
-### Architectural Rationale & Design Patterns
+## Executive Project Summary
+
+This project demonstrates the complete engineering lifecycle of deploying and operating an open-source Large Language Model (LLM) serving platform in production. The system transitions from a local multi-node prototyping environment (`kind`) to a fully automated, observable, and secured cloud deployment on Amazon Web Services (AWS EKS) using Infrastructure as Code (Terraform).
+
+### Core Capabilities
+
+- **Resilient Model Serving**: Serves quantized open-source LLMs (`qwen2.5:0.5b`) on CPU-optimized nodes using Ollama with an isolated FastAPI gateway, decoupling model lifecycle and storage from inference execution.
+- **Infrastructure as Code (IaC)**: Modular Terraform configurations provisioning an Amazon EKS cluster (Kubernetes v1.35), custom VPC networking, public subnets across multiple AZs, managed node groups, and AWS EBS CSI Driver integrations.
+- **Enterprise IAM & Security**: Complete least-privilege security model using AWS IAM Roles for Service Accounts (IRSA) via OIDC, eliminating static AWS credentials and restricting cloud API access per Kubernetes ServiceAccount.
+- **Automated CI/CD & GitOps**: GitHub Actions pipeline executing static linting (`ruff`), unit test suites (`pytest`), container image compilation, and immutable SHA-based image publishing to GitHub Container Registry (GHCR).
+- **Production Observability and SRE Alerting**: Deployed `kube-prometheus-stack` to monitor SRE Golden Signals (Traffic, Latency, Error Rate). Implemented declarative `PrometheusRule` alerting, debounced incident thresholds, and Alertmanager routing, validated through live fault-injection testing over public AWS Load Balancer endpoints.
+
+---
+
+## Production Architecture
+
+```text
+                                  PUBLIC INTERNET
+                                         │
+                                         │ HTTPS / HTTP (:8000)
+                                         ▼
+                      ┌────────────────────────────────────┐
+                      │    AWS Classic Load Balancer       │
+                      │   (*.ap-south-1.elb.amazonaws.com)  │
+                      └──────────────────┬─────────────────┘
+                                         │
+                                         ▼
+                          AWS EKS CLUSTER (ap-south-1)
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  VPC: 10.0.0.0/16                                                           │
+│                                                                             │
+│  ┌─────────────────────────────────┐   ┌─────────────────────────────────┐  │
+│  │ Public Subnet 1 (ap-south-1a)   │   │ Public Subnet 2 (ap-south-1b)   │  │
+│  │ Managed Node: t3.small          │   │ Managed Node: t3.small          │  │
+│  │                                 │   │                                 │  │
+│  │  ┌───────────────────────────┐  │   │  ┌───────────────────────────┐  │  │
+│  │  │ FastAPI Serving Pod       │  │   │  │ Ollama Backend Pod        │  │  │
+│  │  │ Namespace: llm-serving    │  │   │  │ Namespace: llm-serving    │  │  │
+│  │  │ Port: 8000                │──┼───┼─▶│ Port: 11434               │  │  │
+│  │  └─────────────┬─────────────┘  │   │  └─────────────┬─────────────┘  │  │
+│  │                │                │   │                │                │  │
+│  │                │ /metrics       │   │                │ Dynamic Mount  │  │
+│  │                ▼                │   │                ▼                │  │
+│  │  ┌───────────────────────────┐  │   │  ┌───────────────────────────┐  │  │
+│  │  │ Prometheus Server         │  │   │  │ AWS EBS gp3 Volume        │  │  │
+│  │  │ Namespace: monitoring     │  │   │  │ (Provisioned by EBS CSI)  │  │  │
+│  │  └─────────────┬─────────────┘  │   │  └───────────────────────────┘  │  │
+│  │                │                │   │                                 │  │
+│  │       ┌────────┴────────┐       │   │  ┌───────────────────────────┐  │  │
+│  │       ▼                 ▼       │   │  │ EBS CSI Controller (IRSA) │  │  │
+│  │ ┌───────────┐     ┌───────────┐ │   │  │ Namespace: kube-system    │  │  │
+│  │ │Alertmanager│     │  Grafana  │ │   │  └─────────────┬─────────────┘  │  │
+│  │ └───────────┘     └───────────┘ │   │                │                │  │
+│  └─────────────────────────────────┘   └────────────────┼────────────────┘  │
+└─────────────────────────────────────────────────────────┼───────────────────┘
+                                                          │ OIDC AssumeRole
+                                                          ▼
+                                            ┌───────────────────────────┐
+                                            │ AWS IAM Role: ebs-csi-irsa│
+                                            │ Policy: AmazonEBSCSIDriver│
+                                            └───────────────────────────┘
+```
+
+---
+
+## Core Production Highlights
+
+Key verification milestones across the project's cloud and observability stack:
+
+### 1. Live Public Endpoint Verification on AWS EKS
+Live prompt inference and health probe verification over the public AWS Classic Load Balancer endpoint (`ap-south-1.elb.amazonaws.com:8000`):
+![AWS Classic ELB Public Verification](docs/screenshots/01_eks_elb_public_endpoint_verification.png)
+
+### 2. SRE Golden Signals Observability on AWS EKS
+Production Grafana dashboard tracking real-time Request Rate, P95 Latency, and Error Rate under live cluster traffic:
+![EKS Golden Signals Dashboard](docs/screenshots/02_eks_golden_signals_dashboard.png)
+
+### 3. SRE Incident Alerting & Lifecycle Validation
+Prometheus `HighErrorRate` rule transitioning to `FIRING` during simulated backend failure on AWS EKS:
+![Prometheus Alert Firing](docs/screenshots/03_eks_prometheus_alert_firing.png)
+
+---
+
+## Technology Stack
+
+| Domain | Technology / Tool | Version | Purpose |
+| --- | --- | --- | --- |
+| **Cloud and IaC** | AWS EKS, EC2, EBS gp3, ELB, IAM, VPC | AWS CLI v2 | Production cloud hosting and network isolation |
+| | HashiCorp Terraform | v1.15 | Declarative Infrastructure as Code and state management |
+| **Orchestration and Storage** | Kubernetes | v1.35 / v1.36 | Workload orchestration, scheduling, and service discovery |
+| | `kind` (Kubernetes in Docker) | v0.22 | Local multi-node development and prototyping |
+| | AWS EBS CSI Driver | v1.40+ | Dynamic persistent storage provisioning via IRSA |
+| | Docker | v29 | Containerization and multi-stage image packaging |
+| **Application and Serving** | FastAPI & Uvicorn | Latest | High-throughput asynchronous REST inference API |
+| | Ollama & Qwen 2.5 (0.5B GGUF) | Latest | Quantized local and cloud CPU-based LLM inference engine |
+| | Pydantic & HTTPX | v2 / Latest | Data validation, schema enforcement, and async backend client |
+| **Observability and SRE** | Prometheus Operator (`kube-prometheus-stack`) | Helm Chart | Declarative Kubernetes metrics collection and ServiceMonitors |
+| | Alertmanager & PrometheusRule | Latest | Automated alert evaluation, debouncing, and notification routing |
+| | Grafana | Latest | Version-controlled Golden Signals dashboards (Dashboard-as-Code) |
+| | `prometheus-fastapi-instrumentator` | Latest | Custom latency and HTTP request status metrics instrumentation |
+| **CI/CD and Code Quality** | GitHub Actions | Latest | Automated multi-stage build, test, and release pipelines |
+| | GitHub Container Registry (GHCR) | Latest | Immutable container artifact storage tagged by Git commit SHA |
+| | Ruff & Pytest | Latest | High-speed Python linting, style formatting, and unit testing |
+
+---
+
+## Key Engineering Decisions and Tradeoffs
+
+### 1. Free Tier Resource Optimization and Capacity Planning
+
+- **Context**: AWS managed control planes and multi-node compute clusters quickly accumulate costs if over-provisioned.
+- **Decision**: Architected the cluster around `t3.small` nodes (2 vCPU, 2GB RAM) under AWS Free Tier eligibility instead of unconstrained default instance sizes like `t3.medium` or `m5.large`.
+- **Engineering Judgment**:
+  - Uncovered and resolved an `InvalidParameterCombination` ASG failure where `t3.medium` was rejected by AWS Free Tier policies.
+  - Sized Ollama's memory requests down from `1Gi` (carried over from unconstrained local Docker environments) to `512Mi` request and `1.5Gi` limit. This ensured system pods (AWS VPC CNI, EBS CSI Driver, CoreDNS, kube-proxy) and application workloads coexisted on 2GB nodes without OOM-kills or scheduling gridlocks.
+
+### 2. IAM Roles for Service Accounts (IRSA) vs. Node-Level IAM
+
+- **Context**: The AWS EBS CSI Controller requires IAM permissions (`ec2:CreateVolume`, `ec2:AttachVolume`, etc.) to dynamically provision EBS volumes for the Ollama model store.
+- **Decision**: Implemented an IAM OIDC Identity Provider with a dedicated IAM role bound directly to the Kubernetes ServiceAccount (`system:serviceaccount:kube-system:ebs-csi-controller-sa`) via IRSA, instead of granting the EC2 Node Instance Role broad AWS administrator permissions.
+- **Engineering Judgment**:
+  - EC2 node-role permissions grant broad access to every pod running on that node, violating the principle of least privilege.
+  - IRSA injects temporary STS credentials specifically into the CSI controller pod via Kubernetes service account token projection, isolating AWS API access exclusively to the storage control plane.
+
+### 3. AWS EBS Multi-AZ Volume Affinity and Topology Constraints
+
+- **Context**: The Ollama LLM backend utilizes persistent EBS `gp3` storage (`ollama-pvc`) to persist model weights across restarts.
+- **Decision**: Configured the `StorageClass` with `volumeBindingMode: WaitForFirstConsumer` and analyzed cross-AZ volume affinity constraints.
+- **Engineering Judgment**:
+  - AWS EBS volumes are physical block devices bound to a single Availability Zone (e.g. `ap-south-1a`). When a multi-AZ node group attempts to reschedule a stateful pod to a node in `ap-south-1b`, scheduling fails due to `PersistentVolume node affinity` mismatch.
+  - In production systems, this tradeoff is addressed by either:
+    1. Pinning stateful worker node groups to a single AZ for lightweight workloads.
+    2. Utilizing multi-AZ shared network file storage (AWS EFS CSI Driver) for read-heavy model artifacts.
+    3. Deploying StatefulSets with topology-aware pod scheduling constraints.
+
+### 4. Strict Teardown Discipline and Cloud Cost Guardrails
+
+- **Context**: Cloud infrastructure left running outside active development sessions causes budget exhaustion.
+- **Decision**: Enforced an automated, dependency-aware teardown workflow executed immediately following verification runs.
+- **Engineering Judgment**:
+  - **Deletion Ordering**: Kubernetes `Service` objects of `type: LoadBalancer` must be deleted via `kubectl` *prior* to running `terraform destroy`. If Terraform deletes the VPC/subnets before Kubernetes deprovisions the ELB, the AWS Load Balancer becomes orphaned in AWS and continues billing silently.
+  - **Orphan Sweeps**: Integrated automated AWS CLI queries into teardown procedures to confirm zero unattached EBS volumes (`status=available`) or dangling ELBs remained.
+
+---
+
+## 9-Day Implementation Milestone Summary
+
+| Day | Focus Domain | Key Accomplishments | Core Architectural Pattern | Detailed Log Link |
+| --- | --- | --- | --- | --- |
+| **Day 1** | Local Baseline and Guardrails | AWS billing alerts configured, non-root IAM admin role, toolchain verification, 2-node `kind` cluster setup. | Cost-constrained local sandbox environment | [Day 1 Log](#day-1-infrastructure-and-local-environment-baseline) |
+| **Day 2** | Containerized LLM Serving | Ollama containerized in `kind`, 5Gi PVC for model weights, `initContainer` bootstrap pattern for `qwen2.5:0.5b`. | Decoupled model storage and lifecycle isolation | [Day 2 Log](#day-2-containerized-ollama-deployment-into-kind) |
+| **Day 3** | Microservice Discovery | FastAPI integration, Kubernetes ClusterIP Service, CoreDNS FQDN internal routing. | Dynamic DNS-based microservice discovery | [Day 3 Log](#day-3-kubernetes-service-discovery-and-fastapi-integration) |
+| **Day 4** | CI/CD and Image Registry | GitHub Actions workflow, Ruff static linting, Pytest test suite, immutable SHA image tagging to GHCR. | Immutable artifact pipeline and GitOps boundary | [Day 4 Log](#day-4-automated-cicd-pipeline-and-container-registry-integration) |
+| **Day 5** | Observability Baseline | `kube-prometheus-stack` via Helm, `/metrics` instrumentation, `ServiceMonitor` CRD, Grafana Golden Signals. | Kubernetes-native declarative metrics scraping | [Day 5 Log](#day-5-observability-stack-prometheus-grafana-and-golden-signals-dashboard) |
+| **Day 6** | Alerting and Incident SRE | Alertmanager enabled, `PrometheusRule` CRDs (`HighErrorRate`, `PodNotReady`), live fault injection validation. | SRE alert debounce windows and dashboard-as-code | [Day 6 Log](#day-6-alerting-alertmanager-prometheusrule-and-incident-lifecycle-validation) |
+| **Day 7** | Cloud Migration (EC2) | Terraform IaC for EC2 `t3.micro`, Docker bridge network `llm-net`, IP-scoped security groups, GHCR pull. | Production IaC scaffolding and zero-leakage teardown | [Day 7 Log](#day-7-cloud-migration-aws-ec2-via-terraform) |
+| **Day 8** | Managed EKS and IRSA | EKS v1.35, managed node groups, OIDC / IRSA for EBS CSI driver, dynamic gp3 StorageClass, resource tuning. | Least-privilege IRSA and portable K8s manifests | [Day 8 Log](#day-8-cloud-native-migration-eks-irsa-and-production-kubernetes-friction) |
+| **Day 9** | Cloud Observability and ELB | EKS re-provisioning via IaC, public AWS Classic ELB, live alert validation, multi-AZ EBS analysis. | End-to-end cloud reproducibility and SRE validation | [Day 9 Log](#day-9-observability-on-eks-public-exposure-and-cross-environment-validation) |
+
+---
+
+## Detailed Day-by-Day Engineering and Debugging Logs
+
+---
+
+### Day 1: Infrastructure and Local Environment Baseline
+
+#### Accomplished
+
+- AWS Billing Guardrails configured with alert caps
+- AWS CLI v2 configured with non-root IAM user (`yash-IAM-Admin`)
+- Local toolchain verified: Docker v29, kubectl v1.36, kind v0.22, Terraform v1.15
+- Local 2-node Kubernetes cluster created using `kind` (`devops-ai-cluster`)
+- Ollama local model serving verified
+
+#### Architectural Rationale & Design Patterns
 
 - **Non-root AWS IAM Access**: Used a dedicated IAM administrator identity instead of the AWS root account to reduce operational and security risk.
-
 - **Local Kubernetes via kind**: Chosen to provide a reproducible multi-node Kubernetes environment without incurring cloud infrastructure costs during development.
-
 - **Cost Guardrails**: AWS billing alerts were configured before beginning cloud infrastructure work to prevent unexpected resource consumption.
 
 ---
 
-## Day 2: Containerized Ollama Deployment into `kind`
+### Day 2: Containerized Ollama Deployment into kind
 
-### Accomplished
+#### Accomplished
 
-- [x] Ollama containerized and deployed into the local `kind` cluster
-- [x] Dedicated Kubernetes namespace configured for LLM serving
-- [x] Persistent Volume Claim (`ollama-pvc`) created
-- [x] Ollama model storage mounted at `/root/.ollama`
-- [x] Init container implemented for automatic model bootstrap
-- [x] `qwen2.5:0.5b` model configured for automatic download
-- [x] Ollama serving container verified
+- Ollama containerized and deployed into the local `kind` cluster
+- Dedicated Kubernetes namespace configured for LLM serving (`llm-serving`)
+- Persistent Volume Claim (`ollama-pvc`) created (5Gi)
+- Ollama model storage mounted at `/root/.ollama`
+- Init container implemented for automatic model bootstrap
+- `qwen2.5:0.5b` model configured for automatic download
+- Ollama serving container verified
 
-### Architectural Rationale & Design Patterns
+#### Architectural Rationale & Design Patterns
 
 - **CPU-based Serving**: Retained Ollama GGUF quantized models on CPU to avoid GPU overhead and unnecessary infrastructure costs in local `kind` clusters.
-
 - **Persistent Storage (`ollama-pvc`)**: Mounted a 5Gi PVC to `/root/.ollama` to decouple model-weight storage from pod lifecycles, eliminating unnecessary model re-downloads after pod restarts.
-
 - **Init Container Bootstrap Pattern**: Introduced an `initContainer` named `model-puller` to verify Ollama readiness using `ollama list` and fetch `qwen2.5:0.5b` model weights before the primary serving container starts.
-
 - **Container Lifecycle Separation**: Model initialization is isolated from the serving process, allowing the main Ollama container to start only after the required model artifacts are available.
 
 ---
 
-## Day 3: Kubernetes Service Discovery & FastAPI Integration
+### Day 3: Kubernetes Service Discovery and FastAPI Integration
 
-### Accomplished
+#### Accomplished
 
-- [x] FastAPI application integrated with the Ollama backend
-- [x] Kubernetes Service created for Ollama
-- [x] FastAPI configured to communicate with Ollama through Kubernetes DNS
-- [x] Hardcoded Pod IP addressing eliminated
-- [x] Internal service communication established using the Kubernetes FQDN
+- FastAPI application integrated with the Ollama backend
+- Kubernetes Service created for Ollama
+- FastAPI configured to communicate with Ollama through Kubernetes DNS
+- Hardcoded Pod IP addressing eliminated
+- Internal service communication established using the Kubernetes FQDN
 
-### Architectural Rationale & Design Patterns
+#### Architectural Rationale & Design Patterns
 
 - **Kubernetes DNS-Based Service Discovery**: The FastAPI layer communicates with the Ollama backend using the Kubernetes CoreDNS domain:
-
   `http://ollama-service.llm-serving.svc.cluster.local:11434`
-
-- **Dynamic IP Assignment**: Pod IPs and Service ClusterIPs are dynamic. Hardcoding IP addresses would make the application fragile whenever pods are rescheduled or services are recreated.
-
+- **Dynamic IP Assignment**: Pod IPs and Service ClusterIPs are dynamic. Hardcoding IP addresses makes the application fragile whenever pods are rescheduled or services are recreated.
 - **Namespace-Scoped Discovery**: Kubernetes Fully Qualified Domain Names follow the standard format:
-
   `<service-name>.<namespace>.svc.cluster.local`
-
   This allows services to communicate reliably across namespaces without depending on the underlying cluster topology.
-
 - **Decoupled Architecture**: FastAPI depends on the stable Kubernetes Service abstraction rather than individual Ollama pods. This allows the Ollama backend to scale horizontally without requiring application-level configuration changes.
 
-- **Service Abstraction**: Kubernetes Services provide a stable network endpoint and load-balancing layer in front of potentially multiple Ollama replicas.
-
-### Service Communication Flow
+#### Service Communication Flow
 
 ```text
                     Kubernetes Cluster
@@ -114,216 +288,120 @@ End-to-end Kubernetes-based deployment platform for serving Open-Source LLMs wit
 
 ---
 
-## Day 4: Automated CI/CD Pipeline & Container Registry Integration
+### Day 4: Automated CI/CD Pipeline and Container Registry Integration
 
-### Accomplished
+#### Accomplished
 
-- [x] Automated CI/CD workflow created using GitHub Actions (`.github/workflows/ci.yaml`)
-- [x] Code quality and linting automated using `ruff`
-- [x] Automated unit test suite implemented using `pytest`
-- [x] Pydantic schema validation verified
-- [x] `/health` probe logic verified
-- [x] Container image builds automated
-- [x] Container images published to GitHub Container Registry (GHCR)
-- [x] Immutable image tagging strategy implemented using Git commit SHAs (`${{ github.sha }}`)
+- Automated CI/CD workflow created using GitHub Actions (`.github/workflows/ci.yaml`)
+- Code quality and linting automated using `ruff`
+- Automated unit test suite implemented using `pytest`
+- Pydantic schema validation verified
+- `/health` probe logic verified
+- Container image builds automated
+- Container images published to GitHub Container Registry (GHCR)
+- Immutable image tagging strategy implemented using Git commit SHAs (`${{ github.sha }}`)
 
-### Architectural Rationale & Design Patterns
+#### Architectural Rationale & Design Patterns
 
 - **Static Code Analysis (`ruff`)**: Integrated high-performance Python linting into the CI pipeline to enforce code-quality standards and maintain consistent import ordering before container image assembly.
-
 - **Automated Verification (`pytest`)**: Unit tests execute automatically on every push and pull request targeting `main`. This provides an early validation layer for API behavior, Pydantic schemas, and health-check endpoints before artifacts are built.
-
 - **Immutable Artifact Strategy**: Container images are tagged using the Git commit SHA (`${{ github.sha }}`), creating a deterministic relationship between source code and the resulting artifact. This avoids the ambiguity associated with mutable tags such as `:latest`.
-
 - **GitHub Container Registry (GHCR)**: GHCR is used as the centralized container artifact registry, providing a persistent location for versioned images that can later be consumed by Kubernetes or a GitOps deployment controller.
+- **Deliberate Deployment Boundary**: The CI pipeline intentionally terminates after publishing the container image and updating the deployment manifest.
 
-- **Deliberate Deployment Boundary**: The CI pipeline intentionally terminates after publishing the container image. Automated deployment to the local `kind` cluster is excluded because GitHub-hosted runners cannot directly access the developer's local Kubernetes network namespace without additional tunneling or self-hosted infrastructure.
-
-- **GitOps Readiness**: Stopping at artifact publication establishes a clean separation between **CI** and **CD**. The resulting immutable image can later become the deployment input for a remote Kubernetes cluster and GitOps controller.
-
-### CI/CD Pipeline Flow
+#### CI/CD Pipeline Flow
 
 ```text
                          Git Repository
-                              │
-                              │ Push / Pull Request
-                              ▼
-                    ┌─────────────────────┐
-                    │    GitHub Actions   │
-                    │      CI Runner      │
-                    └──────────┬──────────┘
                                │
-                  ┌────────────┼────────────┐
-                  │            │            │
-                  ▼            ▼            ▼
-             ┌────────┐   ┌────────┐   ┌─────────────┐
-             │  Ruff  │   │ Pytest │   │ Pydantic /  │
-             │ Linting│   │  Tests │   │ Health Check│
-             └────┬───┘   └────┬───┘   └──────┬──────┘
-                  │            │              │
-                  └────────────┼──────────────┘
-                               │
-                         Validation Pass
-                               │
+                               │ Push / Pull Request
                                ▼
-                    ┌─────────────────────┐
-                    │  Docker Image Build │
-                    └──────────┬──────────┘
-                               │
-                               │ Tag:
-                               │ <github-sha>
-                               ▼
-                    ┌─────────────────────┐
-                    │        GHCR         │
-                    │ GitHub Container    │
-                    │      Registry       │
-                    └──────────┬──────────┘
-                               │
-                               │ Immutable Artifact
-                               ▼
-                    ┌─────────────────────┐
-                    │   Future CD /       │
-                    │   GitOps Layer      │
-                    └──────────┬──────────┘
-                               │
-                               ▼
-                    ┌─────────────────────┐
-                    │ Remote Kubernetes   │
-                    │      Cluster        │
-                    └─────────────────────┘
-
-                    ─────────────────────
-                     CURRENT DAY 4 STOP
-                    ─────────────────────
-```
-
-### Artifact Versioning Strategy
-
-```text
-Git Commit
-   │
-   │ abc1234...
-   ▼
-GitHub Actions
-   │
-   │ Docker Build
-   ▼
-GHCR Image
-   │
-   └── <image>:abc1234...
-
-Source Code ───────────────► Container Image
-     │                              │
-     │                              │
-     └──── Git SHA ─────────────────┘
-              │
-              ▼
-        Full Traceability
-```
-
-### Key CI/CD Pattern
-
-```text
-Code
- │
- ▼
-Lint
- │
- ▼
-Test
- │
- ▼
-Build
- │
- ▼
-Tag with Git SHA
- │
- ▼
-Push to GHCR
- │
- ▼
-Future GitOps Deployment
+                     ┌─────────────────────┐
+                     │    GitHub Actions   │
+                     │      CI Runner      │
+                     └──────────┬──────────┘
+                                │
+                   ┌────────────┼────────────┐
+                   │            │            │
+                   ▼            ▼            ▼
+              ┌────────┐   ┌────────┐   ┌─────────────┐
+              │  Ruff  │   │ Pytest │   │ Pydantic /  │
+              │ Linting│   │  Tests │   │ Health Check│
+              └────┬───┘   └────┬───┘   └──────┬──────┘
+                   │            │              │
+                   └────────────┼──────────────┘
+                                │
+                          Validation Pass
+                                │
+                                ▼
+                     ┌─────────────────────┐
+                     │  Docker Image Build │
+                     └──────────┬──────────┘
+                                │
+                                │ Tag: <github-sha>
+                                ▼
+                     ┌─────────────────────┐
+                     │        GHCR         │
+                     │ GitHub Container    │
+                     │      Registry       │
+                     └──────────┬──────────┘
+                                │
+                                │ GitOps Sync
+                                ▼
+                     ┌─────────────────────┐
+                     │ k8s Manifest Update │
+                     └─────────────────────┘
 ```
 
 ---
----
 
-## Day 5: Observability Stack — Prometheus, Grafana & Golden Signals Dashboard
+### Day 5: Observability Stack — Prometheus, Grafana and Golden Signals Dashboard
 
-### Accomplished
-- [x] FastAPI application instrumented using `prometheus-fastapi-instrumentator`
-- [x] `/metrics` endpoint exposed on the API service
-- [x] `kube-prometheus-stack` deployed via Helm into a dedicated `monitoring` namespace
-- [x] `ServiceMonitor` (`llm-api-servicemonitor`) configured to scrape the API service
-- [x] Prometheus target verified as `UP` with successful scrape health
-- [x] Grafana dashboard built with three golden-signal panels:
-  - Request rate
-  - P95 latency
-  - Error rate
-- [x] Dashboard exported as JSON and version-controlled (`monitoring/dashboards/golden-signals.json`)
-- [x] Load-tested end-to-end pipeline to validate live metric flow
+#### Accomplished
 
-### Dashboard Preview
+- FastAPI application instrumented using `prometheus-fastapi-instrumentator`
+- `/metrics` endpoint exposed on the API service
+- `kube-prometheus-stack` deployed via Helm into a dedicated `monitoring` namespace
+- `ServiceMonitor` (`llm-api-servicemonitor`) configured to scrape the API service
+- Prometheus target verified as `UP` with successful scrape health
+- Grafana dashboard built with three golden-signal panels: Request rate, P95 latency, Error rate
+- Dashboard exported as JSON and version-controlled (`monitoring/dashboards/golden-signals.json`)
+- Load-tested end-to-end pipeline to validate live metric flow
+
+#### Dashboard Preview
 
 ![Golden Signals Dashboard](monitoring/dashboards/golden_signals.png)
 
-### Architectural Rationale & Design Patterns
-- **`kube-prometheus-stack` over hand-rolled manifests**: Used the community Helm chart (Prometheus + Grafana + Alertmanager bundled) rather than deploying each component manually. This mirrors how most real infrastructure teams operate this stack and avoids reinventing scrape-config plumbing.
-- **ServiceMonitor as the scrape-config abstraction**: Rather than editing Prometheus's scrape config directly, a `ServiceMonitor` CRD declares *what* to scrape declaratively, and the Prometheus Operator reconciles it. This is the standard Kubernetes-native pattern for metrics discovery.
-- **Golden Signals over exhaustive metrics**: The dashboard intentionally limits scope to request rate, latency (p95), and error rate — the three signals most directly tied to service health — rather than dumping every available metric onto one panel. Readability over completeness.
-- **Immutable image tagging paid off**: The Day 4 SHA-based tagging strategy made it trivial to distinguish "old code, still running" from "new code, not yet deployed" once the stale-image bug surfaced (see below).
+#### Architectural Rationale & Design Patterns
 
-### Debugging Log
+- **`kube-prometheus-stack` over hand-rolled manifests**: Used the community Helm chart (Prometheus + Grafana + Alertmanager bundled) rather than deploying each component manually, mirroring standard enterprise operations.
+- **ServiceMonitor as the scrape-config abstraction**: Declaratively defines metric endpoints reconciled by the Prometheus Operator.
+- **Golden Signals over exhaustive metrics**: Dashboard limits scope to request rate, latency (p95), and error rate—the three signals directly tied to service health.
 
-This was the real work of the day. Every fix below was a genuine dead-end resolved by checking one layer deeper — documented here because tracing failures across a distributed system is a stronger signal of competency than a dashboard screenshot alone.
+#### Debugging Log
 
-**1. Prometheus silently ignoring the ServiceMonitor (label selector mismatch)**
-- Symptom: `ServiceMonitor` existed, but Prometheus's Service Discovery page showed nothing.
-- Root cause: `kube-prometheus-stack`'s Prometheus CR only watches `ServiceMonitors` carrying a `release: prometheus-stack` label by default (`spec.serviceMonitorSelector.matchLabels`). The custom `ServiceMonitor` didn't have it, so it was invisible to Prometheus — no error, just silence.
-- Fix: added `labels: { release: prometheus-stack }` to the `ServiceMonitor`'s metadata and re-applied.
+1. **Prometheus silently ignoring the ServiceMonitor (label selector mismatch)**
+   - Symptom: `ServiceMonitor` existed, but Prometheus's Service Discovery page showed nothing.
+   - Root cause: `kube-prometheus-stack`'s Prometheus CR only watches `ServiceMonitors` carrying a `release: prometheus-stack` label by default (`spec.serviceMonitorSelector.matchLabels`). The custom `ServiceMonitor` lacked this label.
+   - Fix: Added `labels: { release: prometheus-stack }` to the `ServiceMonitor` metadata and re-applied.
 
-**2. ServiceMonitor discovered, but "0/0 No targets"**
-- Symptom: label fix resolved discovery, but the scrape pool showed zero targets.
-- Root cause: the underlying `Service` (`llm-api-service`) had no live endpoints — meaning zero pods were actually running.
-- Investigation: `kubectl get deployments -n llm-serving` showed both deployments at `0/0` desired replicas, with `kubectl get events` returning nothing (no crash, no OOM, no scheduling failure — replicas had simply been set to zero, without any recorded event trail).
-- Fix: `kubectl scale deployment <name> -n llm-serving --replicas=1` for both deployments.
+2. **ServiceMonitor discovered, but "0/0 No targets"**
+   - Symptom: Label fix resolved discovery, but the scrape pool showed zero targets.
+   - Root cause: The underlying `Service` (`llm-api-service`) had zero running pods (`0/0` replicas).
+   - Fix: Scaled deployments to 1 replica (`kubectl scale deployment <name> -n llm-serving --replicas=1`).
 
-**3. Target `UP` in discovery, but scraping failed with `404 Not Found`**
-- Symptom: pod resolved correctly, Prometheus reached it over the network, but `/metrics` returned 404.
-- Root cause: the running pod was serving a stale image built on Day 3, before Prometheus instrumentation was added to `main.py` on Day 5. The code was correct — it had simply never been rebuilt and reloaded into the `kind` cluster.
-- Fix: `docker build` → `kind load docker-image` → bumped the image tag in the Deployment manifest → `kubectl apply` → confirmed `/metrics` returned valid Prometheus-format output before re-checking Prometheus.
+3. **Target `UP` in discovery, but scraping failed with `404 Not Found`**
+   - Symptom: Prometheus reached the pod over the network, but `/metrics` returned 404.
+   - Root cause: The running pod was serving an older image built before Prometheus instrumentation was added to `main.py`.
+   - Fix: Rebuilt image, reloaded into `kind`, bumped manifest tag, and re-applied.
 
-**4. Port drift between local YAML, live cluster state, and the container**
-- Symptom: `kubectl port-forward` failed with "Service does not have a service port 8001."
-- Root cause: `api-service.yaml` had been locally edited to `port: 8001` but never re-applied, while the Dockerfile and the live cluster Service were still on `8000` — three sources of truth had drifted out of sync with each other.
-- Fix: reverted the Service manifest to `8000` (matching the Dockerfile's `EXPOSE`/`uvicorn --port`), re-applied, and confirmed live cluster state matched the file before proceeding.
+4. **Port drift between local YAML, live cluster state, and the container**
+   - Symptom: `kubectl port-forward` failed with "Service does not have a service port 8001."
+   - Root cause: `api-service.yaml` had been locally edited to `port: 8001` but never re-applied, while Dockerfile and Service were on `8000`.
+   - Fix: Reverted Service manifest to `8000`, re-applied, and verified parity.
 
-**Takeaway:** every failure here traced back to a *silent* mismatch — a missing label, a stale image, a config file that was edited but never applied — none of which threw a loud error until the very last layer (`/targets` page, `curl`, or `port-forward`). This is the actual shape of Kubernetes/Prometheus debugging in production: work backward through the selector chain (Prometheus → ServiceMonitor → Service → Pod) one link at a time rather than guessing at the whole system.
+#### Golden Signals Queries (PromQL)
 
-### Observability Data Flow
-```text
-                    Kubernetes Cluster
-┌───────────────────────────────────────────────────────────────┐
-│                                                                 │
-│  ┌──────────────────┐        /metrics        ┌───────────────┐│
-│  │   FastAPI Pod    │◄───────────────────────│  Prometheus   ││
-│  │  (instrumented)  │      scrape every 5s    │    Server     ││
-│  └──────────────────┘                         └───────┬───────┘│
-│                                                        │        │
-│                                            ServiceMonitor       │
-│                                          (release label match)  │
-│                                                        │        │
-│                                                        ▼        │
-│                                              ┌───────────────┐  │
-│                                              │    Grafana    │  │
-│                                              │   Dashboard   │  │
-│                                              │ (Golden Signals)│ │
-│                                              └───────────────┘  │
-│                                                                 │
-└───────────────────────────────────────────────────────────────┘
-```
-
-### Golden Signals Queries
 ```promql
 # Request Rate
 sum(rate(http_requests_total{job="llm-api-service"}[1m]))
@@ -336,24 +414,23 @@ sum(rate(http_requests_total{job="llm-api-service", status=~"4..|5.."}[1m])) or 
 ```
 
 ---
----
 
-## Day 6: Alerting — Alertmanager, PrometheusRule & Incident Lifecycle Validation
+### Day 6: Alerting — Alertmanager, PrometheusRule and Incident Lifecycle Validation
 
-### Accomplished
-- [x] Alertmanager enabled via Helm upgrade (was disabled by default in the original chart install)
-- [x] Verified Prometheus → Alertmanager delivery path via `alerting.alertmanagers` config
-- [x] Three `PrometheusRule` alerts authored and deployed (`k8s/api-alerts.yaml`):
+#### Accomplished
+
+- Alertmanager enabled via Helm upgrade
+- Verified Prometheus to Alertmanager delivery path via `alerting.alertmanagers` config
+- Three `PrometheusRule` alerts authored and deployed (`k8s/api-alerts.yaml`):
   - `HighErrorRate` — fires when 5xx ratio exceeds 5% for 2+ minutes
   - `PodNotReady` — fires when any pod in `llm-serving` is not-ready for 1+ minute
   - `HighLatencyP95` — fires when p95 latency exceeds 2s for 5+ minutes
-- [x] Forced a real outage (Ollama scaled to zero) to validate the full alert lifecycle
-- [x] Confirmed alert transition: `Inactive` → `Pending` → `Firing` → resolved
-- [x] Confirmed alert delivery into Alertmanager's UI, distinct from built-in `kube-system` noise alerts
-- [x] Diagnosed and fixed a Grafana dashboard persistence bug (dashboards lost on pod restart)
-- [x] Re-imported the golden-signals dashboard from Day 5's exported JSON and confirmed recovery
+- Forced a real outage (Ollama scaled to zero) to validate the full alert lifecycle
+- Confirmed alert transition: `Inactive` -> `Pending` -> `Firing` -> resolved
+- Confirmed alert delivery into Alertmanager's UI
+- Diagnosed and fixed Grafana dashboard persistence bug via PVC configuration
 
-### Incident & Alert Validation Previews
+#### Incident and Alert Validation Previews
 
 #### Full Golden Signals Incident Lifecycle Dashboard
 ![Incident Lifecycle Dashboard](monitoring/dashboards/incident_lifecycle_dashboard.png)
@@ -369,488 +446,322 @@ sum(rate(http_requests_total{job="llm-api-service", status=~"4..|5.."}[1m])) or 
 *Failure condition sustained for over 2 minutes; alert transitions to FIRING and routes to Alertmanager:*
 ![Alert Firing State](monitoring/dashboards/alert_firing.png)
 
-### Architectural Rationale & Design Patterns
-- **`PrometheusRule` over manual Alertmanager config**: Same declarative CRD pattern as `ServiceMonitor` — alert rules live as version-controlled Kubernetes objects, reconciled automatically by the Prometheus Operator, rather than hand-edited into a running config file.
-- **`for:` durations on every rule**: Each alert requires its condition to hold for a sustained window (1-5 minutes depending on severity) before firing. This is a deliberate choice to avoid alert fatigue from single-request blips or transient scheduling noise — a core SRE practice, not just a Prometheus syntax requirement.
-- **Real outage over synthetic testing**: Rather than trusting the rule YAML in isolation, the `HighErrorRate` alert was validated by actually taking a dependency offline (`ollama-deployment` scaled to zero) and observing the app's real failure behavior (`503` responses via the `httpx.ConnectError` handler built on Day 3). This proves the alert reflects genuine service degradation, not just a syntactically valid query.
-- **Stateless Grafana as a design flaw, not a given**: Grafana's default Helm install stores dashboards in the pod's local SQLite database with no persistent volume. Any pod restart — Docker Desktop restart, resource pressure, node reschedule — silently wipes every UI-created dashboard with no warning. This is treated here as a bug to fix, not an accepted limitation.
+#### Architectural Rationale & Design Patterns
 
-### Debugging Log
+- **`PrometheusRule` CRD**: Alert rules live as version-controlled Kubernetes objects reconciled automatically by the Prometheus Operator.
+- **`for:` duration debouncing**: Every alert requires its condition to hold for a sustained window (1-5 minutes) before firing, preventing alert fatigue from transient spikes.
+- **Real outage validation**: Validated alerts by taking Ollama offline and observing real HTTP 503 error rates from the FastAPI gateway.
+- **Dashboard-as-Code**: Grafana dashboards versioned in JSON to prevent data loss across pod lifecycles.
 
-**1. Alertmanager pods not running — “disabled” in Status page**
-- Symptom: `kubectl get pods -n monitoring | grep alertmanager` returned nothing.
-- Root cause: `alertmanager.enabled: false` had been explicitly set in the Helm values during the original Day 5 install (likely to conserve local CPU/memory during initial stack setup).
-- Fix: `helm upgrade` with `--reuse-values` and `--set alertmanager.enabled=true`, plus deliberately small resource requests/limits to stay within the local `kind` cluster's CPU budget.
-- Note: the Alertmanager UI's "Cluster Status: disabled" after fixing this was a false alarm — it refers to Alertmanager's gossip clustering for multi-replica HA, which is correctly disabled for a single-replica local instance. Not an error.
+#### Debugging Log
 
-**2. Ten alerts appeared in Alertmanager that were never authored**
-- Symptom: `namespace="kube-system"` group showed 10 firing alerts (`etcdInsufficientMembers`, `KubeProxyInstanceUnreachable`, `TargetDown`, etc.) immediately after enabling Alertmanager.
-- Root cause: these are built-in control-plane health alerts shipped by default with `kube-prometheus-stack`. `kind` clusters don't expose the same control-plane metrics endpoints a managed cluster (EKS/GKE) does, so these fire continuously and are expected noise on any local `kind` setup — unrelated to the application.
-- Resolution: documented as expected behavior rather than "fixed" — no config change needed, just correctly identified as out of scope.
+1. **Alertmanager pods not running**
+   - Root cause: `alertmanager.enabled: false` was set in base values.
+   - Fix: Upgraded Helm release with `--set alertmanager.enabled=true` and custom resource bounds.
 
-**3. `HighErrorRate` rule wouldn't have fired against the original test plan**
-- Initial plan was to hit a nonexistent route to generate 404s, but the rule's `status=~"5.."` filter only matches 5xx, not 4xx.
-- Corrected the test plan instead of the rule: scaled `ollama-deployment` to zero, which makes `/generate` genuinely unreachable and produces real `503`s — matching the rule's actual intent (backend dependency failure) rather than a client-error edge case.
+2. **Control-plane noise alerts in kind**
+   - Symptom: 10 alerts in `kube-system` fired continuously (`etcdInsufficientMembers`, etc.).
+   - Root cause: `kind` does not expose cloud control-plane metrics. Identified as expected local noise.
 
-**4. Grafana dashboard vanished after a Helm upgrade — "Dashboard not found"**
-- Symptom: the Day 5 golden-signals dashboard, previously working, returned a 404 inside Grafana after enabling Alertmanager and later after enabling Grafana persistence.
-- Root cause: Grafana's dashboards are stored in an internal SQLite DB inside the pod's ephemeral filesystem by default. Every pod restart (including the one triggered by `helm upgrade` itself) wipes any dashboard created through the UI.
-- Fix (short-term): re-imported the dashboard from the JSON exported on Day 5 (`monitoring/dashboards/golden-signals.json`) — validating that the earlier discipline of exporting dashboards-as-code, not just building them in the UI, was what made recovery possible.
-- Fix (long-term): `helm upgrade` with `--set grafana.persistence.enabled=true --set grafana.persistence.size=1Gi`, mounting a PVC so Grafana's state survives future pod restarts.
-
-**5. "Failed to fetch" after the persistence fix**
-- Symptom: dashboard loaded, but all three panels showed "No data" with a "Failed to fetch" banner.
-- Root cause: enabling persistence restarted the Grafana pod, invalidating the existing `kubectl port-forward` tunnel, which was still pointed at the terminated pod.
-- Fix: killed and restarted the port-forward against the new pod/service, confirmed connectivity, panels populated immediately.
-
-**Takeaway:** today's failures were less about Kubernetes/Prometheus mechanics (those are largely solved from Day 5) and more about state and lifecycle assumptions — assuming a running pod is a stable pod, and assuming "it worked in the UI" means it's durable. Exporting dashboards as versioned JSON, small as that habit seemed on Day 5, was the difference between a five-minute recovery and losing the whole panel layout.
-
-### Incident Lifecycle — Validated End to End
-
-> [!IMPORTANT]
-> **Incident Lifecycle Dashboard Callout — The Complete Outage Narrative in One View:**
-> The incident-lifecycle dashboard screenshot above ([`monitoring/dashboards/incident_lifecycle_dashboard.png`](file:///home/yash55-max/projects/llm-devops/monitoring/dashboards/incident_lifecycle_dashboard.png)) captures the entire operational narrative across time in a single pane of glass rather than just a static snapshot:
-> 1. **Baseline Operations**: Steady nominal traffic (~0.4 req/s), baseline P95 latency (~90ms), and error rate flatlined at zero.
-> 2. **Fault Injection (01:03:30)**: Ollama deployment scaled to zero replicas (`kubectl scale deployment ollama-deployment --replicas=0`), cutting off the LLM inference backend.
-> 3. **Error Spike & Metric Surge**: FastAPI gracefully catches the connection drops (`httpx.ConnectError`) and issues HTTP 503 responses. The Error Rate panel surges to ~0.49 req/s (100% failure ratio matching the request rate), immediately crossing the 5% error ratio threshold ([`monitoring/dashboards/error-rate.png`](file:///home/yash55-max/projects/llm-devops/monitoring/dashboards/error-rate.png)).
-> 4. **Alert Transition (Pending $\rightarrow$ Firing)**: Prometheus marks `HighErrorRate` as **Pending** at 01:04:48 ([`monitoring/dashboards/alert_pending.png`](file:///home/yash55-max/projects/llm-devops/monitoring/dashboards/alert_pending.png)). Once the 2-minute `for:` window elapses at 01:06:23, it transitions to **Firing** ([`monitoring/dashboards/alert_firing.png`](file:///home/yash55-max/projects/llm-devops/monitoring/dashboards/alert_firing.png)) and dispatches to Alertmanager.
-> 5. **Remediation & Recovery**: Ollama deployment scaled back up to 1 replica. The error rate immediately plunges back to zero and Alertmanager auto-resolves the alert back to `Inactive`.
-
-```text
- 1. Baseline           Ollama healthy, error rate = 0, all alerts Inactive
-         │
-         ▼
- 2. Fault injected      kubectl scale deployment ollama-deployment --replicas=0
-         │
-         ▼
- 3. App detects failure  httpx.ConnectError → FastAPI returns 503
-         │
-         ▼
- 4. Metric shifts        error rate ratio crosses 5% threshold
-         │
-         ▼
- 5. Rule evaluates true  HighErrorRate: Inactive → Pending (01:04:48)
-         │
-         │  (condition holds for full `for: 2m` window)
-         ▼
- 6. Alert fires          HighErrorRate: Pending → Firing (01:06:23)
-         │
-         ▼
- 7. Delivered            Alert appears in Alertmanager UI
-         │
-         ▼
- 8. Fault resolved       kubectl scale deployment ollama-deployment --replicas=1
-         │
-         ▼
- 9. Alert clears         HighErrorRate: Firing → Inactive
-```
-
-### Alert Rules Summary
-```promql
-# HighErrorRate — 5xx ratio > 5% for 2m
-sum(rate(http_requests_total{job="llm-api-service", status=~"5.."}[5m]))
-/
-sum(rate(http_requests_total{job="llm-api-service"}[5m])) > 0.05
-
-# PodNotReady — any pod not-ready for 1m
-kube_pod_status_ready{namespace="llm-serving", condition="true"} == 0
-
-# HighLatencyP95 — p95 latency > 2s for 5m
-histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{job="llm-api-service"}[5m])) by (le)) > 2
-```
+3. **Grafana dashboard lost after Helm upgrade**
+   - Root cause: Grafana default uses ephemeral SQLite DB.
+   - Fix: Re-imported from `golden-signals.json` and enabled persistent storage via `--set grafana.persistence.enabled=true --set grafana.persistence.size=1Gi`.
 
 ---
----
 
-## Day 7: Cloud Migration — AWS EC2 via Terraform
+### Day 7: Cloud Migration — AWS EC2 via Terraform
 
-### Accomplished
-- [x] Provisioned real AWS infrastructure using Terraform (`terraform/`):
+#### Accomplished
+
+- Provisioned real AWS infrastructure using Terraform (`terraform/`):
   - Single `t3.micro` EC2 instance (Ubuntu, 25Gi gp3 root volume)
-  - Dedicated security group scoped to the operator's IP only (SSH + port 8000)
-  - SSH key pair generated and managed via Terraform, not manually uploaded
-- [x] Installed Docker on the EC2 instance
-- [x] Deployed both containers directly via `docker run` (Docker-only today, not Kubernetes — EKS migration deliberately deferred to a later day)
-- [x] Created a custom Docker bridge network (`llm-net`) so the API container reaches Ollama by container name, not a hardcoded IP
-- [x] Pulled the API image from GHCR (Day 4's registry pipeline used in production for the first time)
-- [x] Verified `/health` and `/generate` endpoints responding correctly over the public internet, not just `localhost`
-- [x] Confirmed full teardown via `terraform destroy` — zero resources left running after verification
+  - Dedicated security group scoped to the operator's IP (SSH + port 8000)
+  - SSH key pair generated and managed via Terraform
+- Installed Docker and deployed containers on EC2
+- Configured custom Docker bridge network (`llm-net`) for container-name DNS resolution
+- Pulled API image from GHCR
+- Verified `/health` and `/generate` endpoints over the public EC2 IPv4 address
+- Executed full teardown via `terraform destroy` with zero residual billing
 
-### Deployment & Verification Previews
+#### Deployment and Verification Previews
 
 #### EC2 Container Setup & Docker Bridge Network
-*Ollama initialization, model pull (`qwen2.5:0.5b`), resolving the GHCR container image name, and running both services under the custom `llm-net` network on AWS EC2:*
 ![EC2 Docker Deployment](terraform/screenshots/ec2_docker_deployment.png)
 
 #### Public Internet Endpoint Verification
-*Live endpoint verification over the public EC2 IPv4 address (`43.204.228.127:8000`) for both `/health` and `/generate` inference:*
 ![Public Endpoint Verification](terraform/screenshots/public_endpoint_verification.png)
 
-### Architectural Rationale & Design Patterns
-- **EC2 + Docker before EKS**: deliberately scoped today to plain Docker on a single EC2 instance rather than jumping straight to a managed Kubernetes control plane. EKS's control plane alone costs roughly $73/month if left running — not worth the spend or the added complexity before the basic cloud-networking and registry-auth pieces were proven to work. EKS migration is planned as a separate, later effort, reusing the Kubernetes manifests already written on Days 2-6.
-- **IP-scoped security group, not `0.0.0.0/0`**: both SSH (22) and the API port (8000) are restricted to the operator's IP via a Terraform `data.http` lookup at apply time, rather than exposing an unauthenticated LLM endpoint to the entire internet. A convenient default for tutorials, but not one worth carrying into a portfolio project meant to demonstrate real judgment.
-- **Docker bridge network for service discovery**: the `llm-net` custom network lets the API container resolve Ollama via its container name (`http://ollama:11434`) rather than a hardcoded IP — the same DNS-based service-discovery principle established in Day 3's Kubernetes work, applied at the Docker level instead. Reinforces that the pattern isn't Kubernetes-specific; it's a general "don't hardcode network identity" practice.
-- **Immutable image, reused, not rebuilt**: the exact image built and pushed to GHCR in Day 4's CI pipeline was pulled and run unmodified on EC2 — the artifact produced by CI is the same artifact deployed here, no local rebuild step. This is the traceability the SHA-tagging strategy was meant to provide, now exercised for real.
-- **Aggressive teardown discipline**: infrastructure was destroyed immediately after verification rather than left running for convenience. With a fixed $110 credit budget, `terraform destroy` after every session — not "when I remember to" — is the operating discipline, not an afterthought.
+#### Architectural Rationale & Design Patterns
 
-### Debugging Log
+- **EC2 + Docker staging step**: Scoped initial cloud migration to plain Docker on EC2 to validate cloud networking, security groups, and registry authentication before incurring managed EKS control plane costs.
+- **Strict security group scoping**: SSH (22) and API (8000) locked to the operator's IP using `data.http` lookup at apply time.
+- **Docker bridge network**: Enabled internal hostname discovery (`http://ollama:11434`), mirroring Kubernetes CoreDNS patterns.
+- **Aggressive teardown discipline**: Infrastructure destroyed immediately after verification to stay within cloud budget.
 
-**1. GHCR pull denied — "docker: Error response from daemon: error from registry: denied"**
-- Symptom: `docker run` against `ghcr.io/yash55-max/llm-api:latest` failed twice with a registry `denied` error.
-- Root cause: simple naming mismatch — the package was actually published under `llm-devops`, not `llm-api`. Not a permissions or authentication issue; the image genuinely didn't exist at the referenced path.
-- Fix: corrected the image reference to `ghcr.io/yash55-max/llm-devops:latest`, pull succeeded immediately ([`terraform/screenshots/ec2_docker_deployment.png`](file:///home/yash55-max/projects/llm-devops/terraform/screenshots/ec2_docker_deployment.png)).
+#### Debugging Log
 
-**2. SSH session dropped mid-verification — "Connection to 43.204.228.127 closed by remote host"**
-- Symptom: SSH session terminated unexpectedly right after successful endpoint testing.
-- Root cause: not a fault — `terraform destroy` was run from a separate local terminal immediately after the public-IP curl tests succeeded, tearing down the EC2 instance out from under the active SSH session ([`terraform/screenshots/ec2_docker_deployment.png`](file:///home/yash55-max/projects/llm-devops/terraform/screenshots/ec2_docker_deployment.png)). Expected behavior given the intentional teardown discipline, not a bug.
+1. **GHCR pull denied**
+   - Root cause: Container image repository name was `llm-devops`, not `llm-api`.
+   - Fix: Corrected image path to `ghcr.io/yash55-max/llm-devops:latest`.
 
-### Verified Public Endpoint
-```bash
-curl http://43.204.228.127:8000/health
-# {"status":"ok","ollama_host":"http://ollama:11434"}
-
-curl -X POST http://43.204.228.127:8000/generate \
-  -H "Content-Type: application/json" \
-  -d '{"prompt": "Explain Cloud Computing in one sentence."}'
-# {"model":"qwen2.5:0.5b","response":"Cloud computing is a model of computing in which
-#  various applications and data are stored, processed, and accessed over the internet
-#  through a network, where the underlying infrastructure is managed by a service provider
-#  such as Amazon Web Services..."}
-```
-
-### Deployment Flow
-```text
- Local machine                     GitHub                          AWS
-┌──────────────┐   git push   ┌───────────────┐  docker build  ┌──────────────┐
-│  Source code │ ────────────▶│ GitHub Actions │────────────────▶│     GHCR     │
-└──────────────┘               │   CI Pipeline  │   push (SHA)   │  (registry)  │
-                               └───────────────┘                 └──────┬───────┘
-                                                                        │
-                                                     terraform apply    │ docker pull
-                                                            │           ▼
-                                                            ▼    ┌──────────────┐
-                                                     ┌─────────┐ │  EC2 t3.micro│
-                                                     │Terraform│▶│  Docker Host │
-                                                     └─────────┘ │              │
-                                                                 │ ┌──────────┐ │
-                                                                 │ │ llm-api  │ │
-                                                                 │ │  :8000   │ │
-                                                                 │ └────┬─────┘ │
-                                                                 │      │llm-net│
-                                                                 │ ┌────▼─────┐ │
-                                                                 │ │  ollama  │ │
-                                                                 │ │  :11434  │ │
-                                                                 │ └──────────┘ │
-                                                                 └──────────────┘
-                                                                        │
-                                                              curl (public IP)
-                                                                        │
-                                                                        ▼
-                                                                Verified from
-                                                                local machine
-
-                                              terraform destroy (immediately after)
-                                                        │
-                                                        ▼
-                                              All resources terminated
-```
-
-### Budget Note
-Instance ran for the duration of one build-and-verify session only. `terraform destroy` confirmed 3/3 resources destroyed (`aws_instance`, `aws_key_pair`, `aws_security_group`) with no residual billing.
+2. **SSH session terminated mid-verification**
+   - Root cause: `terraform destroy` triggered from local terminal destroyed instance immediately upon verification completion. Expected lifecycle behavior.
 
 ---
----
 
-## Day 8: Cloud-Native Migration — EKS, IRSA & Production Kubernetes Friction
+### Day 8: Cloud-Native Migration — EKS, IRSA and Production Kubernetes Friction
 
-### Accomplished
-- [x] Extended existing Terraform (not a rewrite) to provision a real EKS cluster:
-  - EKS control plane (Kubernetes 1.35, standard support)
+#### Accomplished
+
+- Extended Terraform configuration to provision a production EKS cluster:
+  - EKS control plane (Kubernetes 1.35)
   - Managed node group (2x `t3.small`, Free Tier eligible)
-  - Dedicated cluster and node IAM roles
-  - EBS CSI driver add-on with proper IRSA binding
-  - OIDC provider for IAM Roles for Service Accounts (IRSA)
-- [x] Reapplied existing Kubernetes manifests from Days 2-6 (`k8s/`) onto real managed infrastructure with minimal changes, proving portability from local `kind`
-- [x] Created a `StorageClass` (`ebs-gp3`, set as default) to enable dynamic EBS-backed PVC provisioning
-- [x] Right-sized Ollama's memory `requests`/`limits` for real node capacity, replacing values inherited from an unconstrained local Docker environment
-- [x] Fixed image references and added a GHCR pull secret so the API deployment could actually pull its private image on a cluster with no pre-existing Docker credentials
-- [x] Verified full end-to-end request flow on real cloud infrastructure: `curl` → API pod → Kubernetes DNS → Ollama pod → response
-- [x] Confirmed complete teardown via `terraform destroy`, including a manual check for orphaned EBS volumes left behind by dynamic provisioning
+  - IAM OIDC Provider for IAM Roles for Service Accounts (IRSA)
+  - AWS EBS CSI Driver addon with dedicated IRSA role
+- Reapplied existing Kubernetes manifests (`k8s/`) with minimal changes
+- Created dynamic `StorageClass` (`ebs-gp3`) set as default
+- Right-sized Ollama resource requests/limits for 2GB node capacity
+- Created GHCR image pull secrets for private container registry access
+- Verified full request flow: `curl` -> API pod -> Kubernetes DNS -> Ollama pod -> response
+- Teardown verified via `terraform destroy` and manual EBS orphan checks
 
-### Deployment & Verification Previews
+#### Deployment and Verification Previews
 
 #### EKS End-to-End Endpoint Verification
-*Port-forwarded verification of `/health` and live `/generate` inference via Kubernetes DNS across real EKS pods (`ollama-service.llm-serving.svc.cluster.local:11434`):*
 ![EKS Endpoint Verification](terraform/screenshots/eks_endpoint_verification.png)
 
 #### EKS Node Capacity & Pod Allocation
-*AWS EKS console overview of `t3.small` worker node capacity allocation (CPU, memory reservations) and running workload pods:*
 ![EKS Node Capacity Allocation](terraform/screenshots/eks_node_capacity_allocation.png)
 
 #### AWS EKS Node & Kubelet Lifecycle Events
-*Kubelet registration, allocatable limits enforcement, readiness, and scheduling event stream on the provisioned EKS node:*
 ![EKS Node Events](terraform/screenshots/eks_node_events.png)
 
-### Architectural Rationale & Design Patterns
-- **Extend existing Terraform rather than start a new module**: the EKS resources (cluster, node group, IAM, IRSA, addon) were added directly into the same `main.tf` used for earlier infrastructure, keeping one source of truth for the project's cloud footprint rather than fragmenting IaC across multiple untracked configurations.
-- **Free Tier-eligible node sizing, deliberately verified rather than assumed**: `t3.small` was chosen only after confirming via `aws ec2 describe-instance-types --filters "Name=free-tier-eligible,Values=true"` that it was genuinely eligible on this account — not assumed from general AWS documentation, which can lag actual account-level enforcement.
-- **IRSA over node-role IAM for the CSI driver**: the EBS CSI controller calls AWS APIs directly (CreateVolume, AttachVolume, etc.) and is scoped its own dedicated IAM role bound via OIDC/IRSA to its specific Kubernetes service account, rather than inheriting broad permissions from the underlying EC2 node's role. This follows the principle of least privilege that's specifically expected on production EKS clusters, and is different from how the simpler Day 7 EC2/Docker setup handled permissions.
-- **Manifest portability as the actual point of the exercise**: the Kubernetes objects themselves (Deployments, Services, PVCs) required almost no changes between `kind` and EKS — the friction was entirely in the surrounding cloud plumbing (IAM, storage classes, image registries, resource sizing), which is the realistic split between "Kubernetes knowledge" and "cloud operations knowledge."
-- **Right-sizing resource requests per environment, not copy-pasting them**: Ollama's `1Gi` memory request, fine on a local machine with abundant free RAM, was tight enough on a real `2GB` node (after system/CNI/CSI overhead) to block scheduling entirely. This is treated as a deliberate lesson, not a bug — manifests written for one environment carry implicit assumptions that don't automatically hold in another.
+#### Architectural Rationale & Design Patterns
 
-### Debugging Log
+- **IRSA over node-role IAM**: The EBS CSI controller calls AWS APIs using a dedicated IAM role bound to its service account via OIDC, enforcing least privilege.
+- **Manifest Portability**: Kubernetes manifests written for `kind` deployed onto AWS EKS with zero structural rewrites, proving cloud-native portability.
+- **Resource Right-Sizing**: Tuned container requests to operate reliably on resource-constrained cloud nodes.
 
-**1. EKS cluster created with an end-of-support Kubernetes version**
-- Symptom: console flagged "Kubernetes version no longer supported by Amazon EKS" immediately after cluster creation.
-- Root cause: `main.tf` had `version = "1.30"` hardcoded, which had aged out of EKS's standard support window by the time of provisioning.
-- Fix: destroyed the just-created control plane immediately (cheap at this stage — no node group yet) and reprovisioned with `version = "1.35"`, confirmed via the console to carry standard support until March 2027.
+#### Debugging Log
 
-**2. Node group launch failure — `AsgInstanceLaunchFailures: InvalidParameterCombination`**
-- Symptom: node group sat in `CREATING` for over 30 minutes with an empty `health.issues` array, giving no early signal anything was wrong. AWS CLI checks (`describe-nodegroup`, `describe-instances`) showed zero EC2 instances had even launched.
-- Root cause: `t3.medium`, the originally configured instance type, is not Free Tier-eligible on this account. The ASG silently failed to launch any instances rather than erroring immediately.
-- Fix: switched to `t3.small`, confirmed Free Tier-eligible via `describe-instance-types`, node group succeeded in under 2 minutes.
-- Lesson: EKS node group failures don't always surface fast — the AWS console's "Health issues" tab found the root cause instantly, faster than digging through Terraform/CLI output. Check the console first on unexplained multi-minute hangs.
+1. **EKS cluster created with end-of-support Kubernetes version**
+   - Root cause: Hardcoded `version = "1.30"` had aged out of AWS standard support.
+   - Fix: Re-provisioned with `version = "1.35"` (standard support through March 2027).
 
-**3. Stale Terraform state lock after an interrupted `apply`**
-- Symptom: `Error acquiring the state lock` blocking all further Terraform commands.
-- Root cause: an earlier `apply` had been killed mid-operation (in response to the node group hang above), leaving a lock that the local backend couldn't automatically release, and `terraform force-unlock` itself failed with `"Local state cannot be unlocked by another process"` despite no live process actually holding the file.
-- Fix: verified via `lsof`/`fuser` that nothing was genuinely holding the state file, then proceeded with `-lock=false` for a one-time, deliberately-scoped bypass — acceptable here specifically because concurrent access had already been ruled out, not a general practice.
-- Lesson: local Terraform state plus interrupted operations is a known solo-development pain point; remote state with proper locking (S3 + DynamoDB) exists specifically to handle this more gracefully.
+2. **Node group launch failure (`InvalidParameterCombination`)**
+   - Symptom: Node group stuck in `CREATING` for 30+ minutes without launching instances.
+   - Root cause: Configured `t3.medium` instance type was not Free Tier eligible on this account.
+   - Fix: Switched to `t3.small` (verified Free Tier eligible); node group came up in under 2 minutes.
 
-**4. EBS CSI controller pods `CrashLoopBackOff` with HTTP 500 on liveness probe**
-- Symptom: node-plugin CSI pods (local, no AWS API calls) ran fine; controller pods (which call AWS APIs like `CreateVolume`) failed to become healthy, cycling through all sidecar containers restarting repeatedly.
-- Root cause: the node IAM role had `AmazonEBSCSIDriverPolicy` attached, but the CSI *controller* pod doesn't inherit node-level IAM by default on modern EKS — it requires its own dedicated IAM role bound to its specific Kubernetes service account via IRSA (IAM Roles for Service Accounts), which requires an OIDC identity provider to exist for the cluster.
-- Fix: added `aws_iam_openid_connect_provider`, a dedicated `aws_iam_role.ebs_csi_irsa` trusted only by `system:serviceaccount:kube-system:ebs-csi-controller-sa`, and pointed the addon at it via `service_account_role_arn`.
-- Complication: updating `service_account_role_arn` on an *already-existing* addon (created without IRSA) hung for the full 20-minute AWS provider timeout without completing. Recreating the addon fresh (`tainted`, forced replace) with IRSA specified from creation resolved it in under a minute — suggesting in-place IRSA retrofits on EKS addons are a rough edge worth avoiding when possible.
+3. **EBS CSI controller pods CrashLoopBackOff with HTTP 500**
+   - Root cause: CSI controller pod lacked dedicated IAM role via IRSA.
+   - Fix: Added `aws_iam_openid_connect_provider`, created `aws_iam_role.ebs_csi_irsa` trusted by `system:serviceaccount:kube-system:ebs-csi-controller-sa`, and attached to the addon.
 
-**5. PVC stuck `Pending` — no default StorageClass**
-- Symptom: even after the CSI driver was healthy, `ollama-pvc` remained unbound.
-- Root cause: `kind` provided `local-path-storage` as a default StorageClass automatically; EKS provides no default at all out of the box. The CSI driver being healthy doesn't create a StorageClass — that's a separate, explicit step.
-- Fix: created `k8s/storageclass.yaml` (`ebs-gp3`, `provisioner: ebs.csi.aws.com`, marked `is-default-class: true`), which unblocked binding immediately once a pod requiring it was scheduled (`WaitForFirstConsumer` binding mode).
+4. **PVC stuck Pending**
+   - Root cause: EKS provides no default StorageClass out of the box.
+   - Fix: Deployed `k8s/storageclass.yaml` (`ebs-gp3` provisioner with `volumeBindingMode: WaitForFirstConsumer`).
 
-**6. Ollama pod `Pending` — insufficient memory**
-- Symptom: after the PVC issue resolved, scheduling failed with `Insufficient memory` across both nodes.
-- Root cause: Ollama's deployment requested `1Gi` memory, a value carried over from local `kind` (effectively unconstrained RAM via Docker Desktop). On real `t3.small` nodes (2GB total, meaningfully less after system/CNI/CSI overhead), that request didn't fit alongside what was already committed ([`terraform/screenshots/eks_node_capacity_allocation.png`](file:///home/yash55-max/projects/llm-devops/terraform/screenshots/eks_node_capacity_allocation.png)).
-- Fix: lowered the request to `512Mi` (limit kept generous at `1.5Gi`) — comfortably sufficient for a 0.5B-parameter quantized model, and the pod scheduled immediately.
+5. **Ollama pod unschedulable (Insufficient Memory)**
+   - Root cause: Inherited `1Gi` memory request from unconstrained local `kind`.
+   - Fix: Sized down request to `512Mi` (limit `1.5Gi`), pod scheduled immediately.
 
-**7. API pod `ImagePullBackOff` — missing registry prefix, then missing pull secret**
-- Symptom: kubelet reported pull failures against `docker.io/library/llm-api:day5` — a Docker Hub path that was never the actual image location.
-- Root cause: the manifest's `image:` field had no registry prefix at all, a gap invisible on `kind` because the image had been `kind load docker-image`'d locally and never needed to resolve a real registry path.
-- Fix: corrected the reference to `ghcr.io/yash55-max/llm-devops:9f254a0` (verified locally via `docker pull` first), then created a `ghcr-secret` (`kubectl create secret docker-registry`) and added `imagePullSecrets` to the deployment, since the private GHCR package still required authentication even with the correct path.
-
-**8. Service `targetPort` didn't match the container's actual listening port**
-- Symptom: `kubectl port-forward` succeeded at the network level but every request returned "connection refused" from inside the pod's network namespace.
-- Root cause: `api-service.yaml`'s `targetPort` was `8001`, left over from a fix applied directly to a *previous* live cluster's state on Day 6, but never corrected in the source-controlled YAML itself — so the drift resurfaced identically on this fresh cluster.
-- Fix: corrected both `port` and `targetPort` to `8000`, matching the container's actual `EXPOSE`/`uvicorn --port` value.
-- Lesson: fixing a live cluster's resource without updating the tracked manifest just defers the same bug to the next `kubectl apply -f` — worth treating "fix applied" and "fix committed to source" as two separate, both-required steps.
-
-**Takeaway**: today's failures were almost entirely EKS-specific gaps that `kind` had been silently covering for — default storage classes, IRSA-based AWS API auth, real per-node resource accounting, and registry resolution. None of these are Kubernetes problems in the abstract; they're the concrete difference between "runs a manifest" and "operates managed cloud Kubernetes," which is precisely the distinction this project is meant to demonstrate.
-
-### Verified End-to-End (Real EKS Cluster)
-*Live endpoint and inference verification on EKS ([`terraform/screenshots/eks_endpoint_verification.png`](file:///home/yash55-max/projects/llm-devops/terraform/screenshots/eks_endpoint_verification.png)):*
-```bash
-curl http://localhost:8080/health
-# {"status":"ok","ollama_host":"http://ollama-service.llm-serving.svc.cluster.local:11434"}
-
-curl -X POST http://localhost:8080/generate \
-  -H "Content-Type: application/json" \
-  -d '{"prompt": "Explain Kubernetes in one sentence."}'
-# {"model":"qwen2.5:0.5b","response":"Kubernetes is an open-source platform for
-#  containerized applications that automate the deployment, scaling, and management
-#  of containerized applications.","done":true}
-```
-
-### EKS Architecture
-```text
-                              AWS (ap-south-1)
-┌───────────────────────────────────────────────────────────────────────┐
-│  VPC (10.0.0.0/16)                                                    │
-│  ┌─────────────────┐         ┌─────────────────┐                      │
-│  │  Public Subnet 1 │         │  Public Subnet 2 │                    │
-│  │  (ap-south-1a)   │         │  (ap-south-1b)   │                    │
-│  └────────┬─────────┘         └────────┬─────────┘                    │
-│           │                            │                              │
-│  ┌────────▼────────────────────────────▼─────────┐                    │
-│  │            EKS Control Plane (v1.35)           │                   │
-│  └────────┬────────────────────────────┬──────────┘                   │
-│           │                            │                              │
-│  ┌────────▼─────────┐         ┌────────▼─────────┐                    │
-│  │  t3.small node 1  │         │  t3.small node 2  │                  │
-│  │  ┌──────────────┐ │         │  ┌──────────────┐ │                  │
-│  │  │  llm-api pod │ │         │  │  ollama pod  │ │                  │
-│  │  │    :8000     │◄┼─────────┼─▶│    :11434    │ │                  │
-│  │  └──────────────┘ │  DNS    │  └──────┬───────┘ │                  │
-│  │  ┌──────────────┐ │         │         │ PVC     │                  │
-│  │  │ EBS CSI (IRSA)│ │         │  ┌──────▼───────┐ │                 │
-│  │  └──────────────┘ │         │  │ EBS gp3 vol  │ │                  │
-│  └───────────────────┘         │  └──────────────┘ │                  │
-│                                 └───────────────────┘                 │
-└───────────────────────────────────────────────────────────────────────┘
-         ▲
-         │ OIDC / IRSA trust
-         │
-┌────────┴─────────┐
-│  IAM: ebs-csi-irsa│  (scoped to system:serviceaccount:kube-system:ebs-csi-controller-sa)
-└───────────────────┘
-```
-
-### Budget & Cleanup
-Full teardown via `terraform destroy` after verification. Dynamically-provisioned EBS volumes (created by the CSI driver via PVC, not directly by Terraform) were checked separately post-destroy to rule out orphaned billing:
-```bash
-aws ec2 describe-volumes --region ap-south-1 \
-  --filters "Name=status,Values=available" \
-  --query 'Volumes[].{ID:VolumeId,Size:Size,Created:CreateTime}'
-```
+6. **API pod ImagePullBackOff**
+   - Root cause: Missing registry prefix and missing private registry pull secret.
+   - Fix: Set image path to `ghcr.io/yash55-max/llm-devops:<sha>` and added `imagePullSecrets: [name: ghcr-secret]`.
 
 ---
----
 
-## Day 9: Observability on EKS, Public Exposure & Cross-Environment Validation
+### Day 9: Observability on EKS, Public Exposure and Cross-Environment Validation
 
-### Accomplished
-- [x] Recreated EKS cluster from Terraform after full Day 8 teardown — validated that IaC alone reliably reproduces the entire environment (cluster, node group, IRSA, EBS CSI, StorageClass) with zero manual intervention
-- [x] Installed `kube-prometheus-stack` via Helm on real EKS infrastructure, with resource requests pre-sized from Day 8's memory-sizing lesson
-- [x] Reapplied `ServiceMonitor` and `PrometheusRule` manifests deferred from Day 8 — succeeded immediately now that CRDs exist, with the `release: prometheus-stack` label already correctly baked into the YAML from earlier fixes
-- [x] Re-imported the golden-signals Grafana dashboard from its saved JSON export onto a completely fresh cluster, validating the dashboard-as-code discipline established on Day 5
-- [x] Exposed the API via a genuine AWS Classic Load Balancer (`type: LoadBalancer`), replacing `NodePort`/port-forward with a real public endpoint
-- [x] Verified the full request path end-to-end over the public internet: DNS → ELB → Service → pod → Ollama → response
-- [x] Triggered and confirmed a real `HighErrorRate` alert firing through the public endpoint (not port-forward), observed live in both Prometheus and the Grafana dashboard simultaneously
-- [x] Diagnosed a genuine multi-AZ EBS/PVC scheduling constraint during recovery testing
-- [x] Full teardown: LoadBalancer Service deleted first (clean ELB deprovisioning), followed by `terraform destroy`, followed by manual orphan checks
+#### Accomplished
 
-### Observability & Infrastructure Previews
+- Recreated full EKS cluster from scratch via Terraform, validating complete IaC reproducibility
+- Deployed `kube-prometheus-stack` via Helm with pre-sized resource limits
+- Reapplied `ServiceMonitor` and `PrometheusRule` manifests on live cloud cluster
+- Re-imported Golden Signals Grafana dashboard from version-controlled JSON
+- Exposed FastAPI serving layer via AWS Classic Load Balancer (`type: LoadBalancer`)
+- Verified end-to-end inference over public ELB DNS endpoint
+- Triggered real `HighErrorRate` alert over public endpoint and verified Prometheus/Grafana state transition
+- Diagnosed multi-AZ EBS scheduling constraint during pod recreation
+- Clean teardown: Deprovisioned LoadBalancer Service first, followed by `terraform destroy` and orphan verification
+
+#### Observability and Infrastructure Previews
 
 #### EKS Golden Signals Dashboard & Monitoring Stack
-*Re-imported Golden Signals Grafana dashboard running on real EKS infrastructure, with the `kube-prometheus-stack` components (Prometheus Operator, Alertmanager, Node Exporter, Kube State Metrics, Grafana) healthy in the `monitoring` namespace:*
 ![EKS Golden Signals Dashboard](monitoring/dashboards/eks_golden_signals_dashboard.png)
 
 #### AWS Classic Load Balancer Public Endpoint Verification
-*Live endpoint verification over the public AWS Classic ELB hostname (`*.ap-south-1.elb.amazonaws.com:8000`), testing `/health` and prompt inference against the LLM serving stack over the public internet:*
 ![AWS Classic ELB Public Verification](monitoring/dashboards/eks_elb_public_endpoint_verification.png)
 
-#### Prometheus Alert Lifecycle: Firing on Real Cloud Infra
-*Prometheus alerting rule `HighErrorRate` transitioning to FIRING (1) during live fault injection (Ollama scaled to zero while curling the public ELB):*
+#### Prometheus Alert Lifecycle: Firing on Cloud Infrastructure
 ![Prometheus Alert Firing](monitoring/dashboards/eks_prometheus_alert_firing.png)
 
 #### Synchronized Golden Signals Incident Metrics (Grafana)
-*Grafana Golden Signals dashboard reflecting real-time metric surges (Requests rate, P95 latency spike, and Error rate spike) in perfect synchronization with the public ELB fault injection:*
 ![Grafana Incident Metrics Spikes](monitoring/dashboards/eks_grafana_incident_metrics.png)
 
 #### AWS Console Workload Pods Overview
-*AWS EKS console workloads view confirming all 7 pods running across namespaces (`kube-system`, `llm-serving`, `monitoring`):*
 ![AWS EKS Console Workloads](monitoring/dashboards/eks_console_workload_pods.png)
 
-### Architectural Rationale & Design Patterns
-- **IaC reproducibility as a first-class test, not an assumption**: recreating the entire cluster from a full teardown, on a new day, with zero manual fixes needed beyond reapplying Kubernetes-level manifests (namespace, secrets, storage class — none of which are Terraform-managed by design), is the actual proof that the Day 7-8 Terraform work is correct and complete, not just "worked once."
-- **Pre-sizing resource requests from prior lessons**: Prometheus/Grafana/Alertmanager Helm values were set with sensible request/limit values from the start today, directly informed by Day 8's Ollama memory-sizing incident — proactive engineering based on a documented prior failure, rather than repeating the same discovery process.
-- **Classic ELB via default `type: LoadBalancer`, not ALB/NLB**: the in-tree AWS cloud provider provisions a Classic Load Balancer by default for this Service type — a legacy AWS product, chosen here for simplicity and zero extra components. Production setups typically install the AWS Load Balancer Controller add-on to get modern NLB/ALB behavior (faster provisioning, more routing features, lower cost) — noted as a deliberate scope decision, not an oversight.
-- **Deleting the Service before `terraform destroy`, not after**: `kubectl delete svc` on a `LoadBalancer`-type Service triggers Kubernetes' own cloud-provider integration to deprovision the underlying ELB cleanly. Since Terraform never created that ELB directly (Kubernetes did, via the Service controller), running `terraform destroy` first would leave it orphaned and billing indefinitely.
+#### Architectural Rationale & Design Patterns
 
-### Debugging Log
+- **IaC Reproducibility**: Tested full cluster rebuild from empty state to prove zero drift.
+- **Public Ingress via LoadBalancer Service**: Integrated AWS Classic Load Balancer for public inference traffic.
+- **Teardown Sequencing**: Deleting the Kubernetes `LoadBalancer` Service prior to `terraform destroy` ensures the cloud-provider controller deprovisions the underlying ELB cleanly, avoiding orphaned cloud resources.
 
-**1. Grafana pod stuck `2/3 Running`, blank page in browser**
-- Symptom: `kubectl port-forward` tunnel stayed alive and actively handled connections, but the browser rendered nothing. Logs showed repeated `SQLITE_BUSY` database-lock retries and a 138-second timeout (504) on a dashboard API call.
-- Root cause: Grafana's startup sequence on this Helm install includes downloading and registering several bundled plugins (`grafana-pyroscope-app`, `grafana-exploretraces-app`, `grafana-metricsdrilldown-app`, `zipkin`) — meaningfully more startup work than the local `kind` install ever performed — and the initial `200m` CPU limit throttled the main `grafana` container badly enough that it couldn't finish initializing within a reasonable window.
-- Fix: `helm upgrade` with `grafana.resources.limits.cpu` raised to `750m`. New pod reached `3/3 Running` promptly ([`monitoring/dashboards/eks_golden_signals_dashboard.png`](file:///home/yash55-max/projects/llm-devops/monitoring/dashboards/eks_golden_signals_dashboard.png)); the original pod also self-recovered once resource pressure eased.
-- Lesson: this is the same category of issue as Day 8's Ollama memory sizing — values inherited from a resource-unconstrained local environment don't automatically hold on real infrastructure, and CPU throttling during startup can produce symptoms (blank page, timeouts) that look like a networking or configuration bug rather than a resource one.
+#### Debugging Log
 
-**2. ELB DNS name unresolvable immediately after provisioning**
-- Symptom: `curl` and `nslookup` (even against `8.8.8.8`) returned `NXDOMAIN` for several minutes after `kubectl get svc` showed a populated `EXTERNAL-IP` hostname, despite `kubectl describe svc` confirming `EnsuredLoadBalancer` and the AWS `elb describe-load-balancers` API confirming the load balancer existed and was addressable.
-- Root cause: standard DNS propagation delay for a freshly created Classic ELB — the infrastructure was correct and complete from the moment `EnsuredLoadBalancer` fired; only public DNS resolution lagged behind.
-- Resolution: no fix needed — waited roughly 10-13 minutes total, then `nslookup` against `8.8.8.8` returned two valid A records, and the endpoint worked immediately after.
-- Lesson: distinguish "infrastructure is wrong" from "infrastructure is right but not yet visible" before making changes — `kubectl describe svc` and the AWS-side API were the correct sources of truth here, not the DNS resolution symptom.
+1. **Grafana pod stuck 2/3 Running (SQLITE_BUSY / timeouts)**
+   - Root cause: Plugin initializations during startup throttled by default `200m` CPU limit.
+   - Fix: Upgraded Helm values to `grafana.resources.limits.cpu: 750m`; pod reached `3/3 Running`.
 
-**3. PVC/pod scheduling blocked by cross-AZ EBS affinity after Ollama pod recreation**
-- Symptom: after scaling Ollama back up post-alert-test, the new pod stayed `Pending` with `FailedScheduling`: one node had insufficient memory, and the *other* node — which had free memory — was rejected due to "PersistentVolume's node affinity" mismatch ([`monitoring/dashboards/eks_console_workload_pods.png`](file:///home/yash55-max/projects/llm-devops/monitoring/dashboards/eks_console_workload_pods.png)).
-- Root cause: EBS volumes are zone-locked at creation. The existing `ollama-pvc`'s underlying volume lived in `ap-south-1a`; the node with available memory was in `ap-south-1b`. A pod requiring that specific PVC structurally cannot schedule outside the volume's zone, regardless of other resource availability.
-- Resolution: not fixed today — deliberately deprioritized since it didn't block any remaining Day 9 goal (public endpoint and alert-firing tests were already completed and captured before this occurred), and the cluster was being torn down shortly after regardless.
-- Lesson for future work: single-replica stateful workloads on multi-AZ EKS node groups are inherently exposed to this failure mode. Production mitigations include pinning node groups to a single AZ for simple stateful workloads, using EBS multi-attach where supported, or moving to a StatefulSet with per-AZ topology awareness for anything requiring real resilience.
+2. **ELB DNS unresolvable immediately after provisioning**
+   - Symptom: `curl` returned `NXDOMAIN` for several minutes after `kubectl get svc` showed external hostname.
+   - Root cause: Standard DNS propagation delay for newly registered AWS ELB records.
+   - Resolution: Verified AWS ELB state was active via AWS CLI and waited for DNS propagation (~10 minutes).
 
-**Takeaway**: today's issues split cleanly into two categories — problems fully solved (Grafana resource sizing, DNS propagation patience) and one problem correctly diagnosed but deliberately left unresolved due to time/priority tradeoffs, with the reasoning documented rather than silently ignored. Recognizing when *not* to chase a fix is as much a part of real operations work as fixing things.
+3. **Multi-AZ EBS Volume Affinity Scheduling Failure**
+   - Symptom: Ollama pod stayed `Pending` with `PersistentVolume's node affinity mismatch`.
+   - Root cause: EBS volume was provisioned in `ap-south-1a`, while the worker node with free memory was in `ap-south-1b`. EBS volumes cannot attach across Availability Zones.
+   - Takeaway: Single-replica stateful workloads on multi-AZ node groups require AZ pinning, StatefulSet topology spread constraints, or shared multi-AZ storage (EFS).
 
-### Verified Public Endpoint (Real AWS Classic ELB)
-*Live endpoint and inference verification via public AWS Classic Load Balancer ([`monitoring/dashboards/eks_elb_public_endpoint_verification.png`](file:///home/yash55-max/projects/llm-devops/monitoring/dashboards/eks_elb_public_endpoint_verification.png)):*
+#### Verified Public Endpoint Output
+
 ```bash
 curl http://a8931d61cc54f4205beb65058c6ebfc5-1730394859.ap-south-1.elb.amazonaws.com:8000/health
 # {"status":"ok","ollama_host":"http://ollama-service.llm-serving.svc.cluster.local:11434"}
 
-curl -X POST http://a8931d61cc54f4205beb65058c6ebfc5-1730394859.ap-south-1.elb.amazonaws.com:8000/generate \
-  -H "Content-Type: application/json" \
-  -d '{"prompt": "Explain load balancers in one sentence."}'
+curl -X POST http://a8931d61cc54f4205beb65058c6ebfc5-1730394859.ap-south-1.elb.amazonaws.com:8000/generate   -H "Content-Type: application/json"   -d '{"prompt": "Explain load balancers in one sentence."}'
 # {"model":"qwen2.5:0.5b","response":"A load balancer is a type of network service
 #  that distributes traffic evenly across multiple servers or instances, enabling the
 #  server or instance to handle an increasing number of concurrent connections while
 #  minimizing the impact of a single server or instance failure.","done":true}
 ```
 
-### Incident Lifecycle — Verified Through the Public Endpoint
-*Live fault injection and alert verification across Prometheus and Grafana ([`monitoring/dashboards/eks_prometheus_alert_firing.png`](file:///home/yash55-max/projects/llm-devops/monitoring/dashboards/eks_prometheus_alert_firing.png) and [`monitoring/dashboards/eks_grafana_incident_metrics.png`](file:///home/yash55-max/projects/llm-devops/monitoring/dashboards/eks_grafana_incident_metrics.png)):*
+---
+
+## Repository Structure
+
 ```text
- 1. Baseline            All alerts Inactive, dashboard flat
-         │
-         ▼
- 2. Fault injected       kubectl scale deployment ollama-deployment --replicas=0
-         │
-         ▼
- 3. Load via public ELB  curl loop against the real internet-facing endpoint
-         │
-         ▼
- 4. App returns 503s     httpx.ConnectError handler (unchanged since Day 3)
-         │
-         ▼
- 5. HighErrorRate fires  Inactive → Pending → FIRING(1), visible in Prometheus
-         │
-         ▼
- 6. Dashboard confirms   Error rate panel spikes in sync, Grafana + Prometheus agree
-         │
-         ▼
- 7. Fault resolved       kubectl scale deployment ollama-deployment --replicas=1
-```
-
-### End-to-End Architecture (Day 9 State)
-```text
-                         Public Internet
-                                │
-                                │ curl (real DNS)
-                                ▼
-                  ┌─────────────────────────┐
-                  │  AWS Classic ELB         │
-                  │  *.elb.amazonaws.com     │
-                  └────────────┬─────────────┘
-                                │
-                  AWS (EKS, ap-south-1)
-┌───────────────────────────────┼───────────────────────────────┐
-│                                ▼                                │
-│  ┌──────────────┐    ┌──────────────┐                          │
-│  │  llm-api pod  │───▶│  ollama pod  │                          │
-│  │    :8000      │DNS │   :11434     │                          │
-│  └───────┬───────┘    └───────┬──────┘                          │
-│          │ /metrics           │ EBS PVC                          │
-│          ▼                    ▼                                 │
-│  ┌──────────────────────────────────┐                           │
-│  │      Prometheus (scrape)         │                           │
-│  └────────────┬──────────┬──────────┘                           │
-│               │          │                                       │
-│               ▼          ▼                                       │
-│      ┌──────────────┐ ┌──────────────┐                          │
-│      │  Alertmanager │ │   Grafana    │                          │
-│      └──────────────┘ └──────────────┘                          │
-└───────────────────────────────────────────────────────────────┘
-```
-
-### Budget & Cleanup
-Teardown order enforced deliberately: `kubectl delete svc` (ELB deprovision) → `terraform destroy` → manual orphan verification.
-```bash
-kubectl delete svc llm-api-service -n llm-serving
-aws elb describe-load-balancers --region ap-south-1 --query 'LoadBalancerDescriptions[].LoadBalancerName'
-# []
-
-terraform destroy -auto-approve
-
-aws ec2 describe-volumes --region ap-south-1 --filters "Name=status,Values=available" --query 'Volumes[].VolumeId'
-# []
-aws elb describe-load-balancers --region ap-south-1 --query 'LoadBalancerDescriptions[].LoadBalancerName'
-# []
+llm-devops/
+├── .github/
+│   └── workflows/
+│       └── ci.yaml                    # Automated lint, test, build, push, & manifest sync
+├── app/
+│   ├── Dockerfile                     # Optimized Python 3.11 container image
+│   ├── main.py                        # FastAPI inference gateway with Prometheus metrics
+│   ├── requirements.txt               # App dependencies (FastAPI, httpx, instrumentator)
+│   └── tests/
+│       ├── __init__.py
+│       └── test_main.py               # Automated pytest suite for API & health logic
+├── docs/
+│   └── screenshots/                   # Curated production verification highlights
+│       ├── 01_eks_elb_public_endpoint_verification.png
+│       ├── 02_eks_golden_signals_dashboard.png
+│       └── 03_eks_prometheus_alert_firing.png
+├── k8s/
+│   ├── api-alerts.yaml                # PrometheusRule alerts (HighErrorRate, PodNotReady)
+│   ├── api-deployment.yaml            # FastAPI Deployment with GHCR image & pull secrets
+│   ├── api-service.yaml               # LoadBalancer / ClusterIP Service for API ingress
+│   ├── api-servicemonitor.yaml        # ServiceMonitor CRD for Prometheus Operator
+│   ├── ollama-deployment.yaml         # Ollama LLM pod with initContainer model bootstrap
+│   ├── ollama-pvc.yaml                # PersistentVolumeClaim for model storage
+│   ├── ollama-service.yaml            # Internal ClusterIP Service for Ollama
+│   └── storageclass.yaml              # AWS EBS gp3 StorageClass (WaitForFirstConsumer)
+├── monitoring/
+│   └── dashboards/
+│       ├── golden-signals.json        # Exported Grafana Golden Signals dashboard (IaC)
+│       └── *.png                      # Raw dashboard & alert verification captures
+├── terraform/
+│   ├── main.tf                        # VPC, EKS Cluster, Node Group, IRSA, & EBS CSI Addon
+│   ├── outputs.tf                     # EKS cluster endpoint, CA data, & security group IDs
+│   ├── variables.tf                   # Region, cluster name, and instance type variables
+│   └── screenshots/                   # Terraform & EC2/EKS verification captures
+├── kind-config.yaml                   # 2-node local Kubernetes cluster configuration
+└── README.md                          # Top-level platform documentation
 ```
 
 ---
+
+## Quickstart and Reproduction Guide
+
+### Prerequisites
+
+- AWS CLI v2 configured with appropriate IAM permissions
+- Terraform v1.5+
+- kubectl v1.30+
+- Helm v3+
+- Docker v25+
+
+### 1. Provision AWS EKS Infrastructure via Terraform
+
+```bash
+cd terraform
+terraform init
+terraform apply -auto-approve
+```
+
+### 2. Configure kubectl Context
+
+```bash
+aws eks update-kubeconfig --region ap-south-1 --name devops-ai-eks
+kubectl get nodes
+```
+
+### 3. Deploy StorageClass and Persistent Volume
+
+```bash
+kubectl apply -f k8s/storageclass.yaml
+kubectl create namespace llm-serving
+kubectl apply -f k8s/ollama-pvc.yaml
+```
+
+### 4. Deploy LLM Serving Layer & API Gateway
+
+```bash
+# Create GHCR registry secret for private image pulls
+kubectl create secret docker-registry ghcr-secret   --docker-server=ghcr.io   --docker-username=<GITHUB_USERNAME>   --docker-password=<GITHUB_PAT>   -n llm-serving
+
+# Deploy Ollama and FastAPI
+kubectl apply -f k8s/ollama-deployment.yaml
+kubectl apply -f k8s/ollama-service.yaml
+kubectl apply -f k8s/api-deployment.yaml
+kubectl apply -f k8s/api-service.yaml
+```
+
+### 5. Deploy Prometheus Observability Stack
+
+```bash
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+
+helm install prometheus-stack prometheus-community/kube-prometheus-stack   --namespace monitoring   --create-namespace   --set alertmanager.enabled=true   --set grafana.persistence.enabled=true   --set grafana.persistence.size=1Gi   --set grafana.resources.limits.cpu=750m
+
+# Apply ServiceMonitor and Alerting Rules
+kubectl apply -f k8s/api-servicemonitor.yaml
+kubectl apply -f k8s/api-alerts.yaml
+```
+
+### 6. Verify Public Endpoint
+
+```bash
+# Retrieve Load Balancer public hostname
+kubectl get svc llm-api-service -n llm-serving -w
+
+# Test inference
+curl -X POST http://<ELB_HOSTNAME>:8000/generate   -H "Content-Type: application/json"   -d '{"prompt": "What is Site Reliability Engineering?"}'
+```
+
+### 7. Clean Teardown Protocol
+
+```bash
+# 1. Delete LoadBalancer Service first to deprovision AWS ELB cleanly
+kubectl delete svc llm-api-service -n llm-serving
+
+# 2. Destroy Terraform infrastructure
+cd terraform
+terraform destroy -auto-approve
+
+# 3. Verify zero orphaned AWS resources
+aws ec2 describe-volumes --region ap-south-1 --filters "Name=status,Values=available" --query 'Volumes[].VolumeId'
+aws elb describe-load-balancers --region ap-south-1 --query 'LoadBalancerDescriptions[].LoadBalancerName'
+```
