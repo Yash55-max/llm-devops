@@ -2,6 +2,18 @@
 
 An end-to-end cloud-native platform for containerized LLM inference serving, automated CI/CD pipelines, Infrastructure as Code (Terraform), and full-stack Kubernetes observability on AWS EKS.
 
+<p align="center">
+  <img src="https://img.shields.io/badge/AWS-Amazon%20EKS%20%7C%20EC2%20%7C%20ELB-FF9900?style=for-the-badge&logo=amazon-aws&logoColor=white" alt="AWS" />
+  <img src="https://img.shields.io/badge/Kubernetes-v1.35-326CE5?style=for-the-badge&logo=kubernetes&logoColor=white" alt="Kubernetes" />
+  <img src="https://img.shields.io/badge/Terraform-v1.15-844FBA?style=for-the-badge&logo=terraform&logoColor=white" alt="Terraform" />
+  <img src="https://img.shields.io/badge/Docker-v29-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker" />
+  <img src="https://img.shields.io/badge/FastAPI-REST%20Gateway-009688?style=for-the-badge&logo=fastapi&logoColor=white" alt="FastAPI" />
+  <img src="https://img.shields.io/badge/Prometheus-Monitoring-E6522C?style=for-the-badge&logo=prometheus&logoColor=white" alt="Prometheus" />
+  <img src="https://img.shields.io/badge/Grafana-Golden%20Signals-F46800?style=for-the-badge&logo=grafana&logoColor=white" alt="Grafana" />
+  <img src="https://img.shields.io/badge/GitHub%20Actions-CI%2FCD%20%26%20GitOps-2088FF?style=for-the-badge&logo=githubactions&logoColor=white" alt="GitHub Actions" />
+  <img src="https://img.shields.io/badge/Python-3.11-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python" />
+</p>
+
 ---
 
 ## Table of Contents
@@ -15,7 +27,7 @@ An end-to-end cloud-native platform for containerized LLM inference serving, aut
   - [2. IAM Roles for Service Accounts (IRSA) vs. Node-Level IAM](#2-iam-roles-for-service-accounts-irsa-vs-node-level-iam)
   - [3. AWS EBS Multi-AZ Volume Affinity and Topology Constraints](#3-aws-ebs-multi-az-volume-affinity-and-topology-constraints)
   - [4. Strict Teardown Discipline and Cloud Cost Guardrails](#4-strict-teardown-discipline-and-cloud-cost-guardrails)
-- [9-Day Implementation Milestone Summary](#9-day-implementation-milestone-summary)
+- [10-Day Implementation Milestone Summary](#10-day-implementation-milestone-summary)
 - [Detailed Day-by-Day Engineering and Debugging Logs](#detailed-day-by-day-engineering-and-debugging-logs)
   - [Day 1: Infrastructure and Local Environment Baseline](#day-1-infrastructure-and-local-environment-baseline)
   - [Day 2: Containerized Ollama Deployment into kind](#day-2-containerized-ollama-deployment-into-kind)
@@ -26,6 +38,7 @@ An end-to-end cloud-native platform for containerized LLM inference serving, aut
   - [Day 7: Cloud Migration — AWS EC2 via Terraform](#day-7-cloud-migration-aws-ec2-via-terraform)
   - [Day 8: Cloud-Native Migration — EKS, IRSA and Production Kubernetes Friction](#day-8-cloud-native-migration-eks-irsa-and-production-kubernetes-friction)
   - [Day 9: Observability on EKS, Public Exposure and Cross-Environment Validation](#day-9-observability-on-eks-public-exposure-and-cross-environment-validation)
+  - [Day 10: CD Loop Completion, GitOps Automation and Portfolio Consolidation](#day-10-cd-loop-completion-gitops-automation-and-portfolio-consolidation)
 - [Repository Structure](#repository-structure)
 - [Quickstart and Reproduction Guide](#quickstart-and-reproduction-guide)
 
@@ -176,7 +189,7 @@ Prometheus `HighErrorRate` rule transitioning to `FIRING` during simulated backe
 
 ---
 
-## 9-Day Implementation Milestone Summary
+## 10-Day Implementation Milestone Summary
 
 | Day | Focus Domain | Key Accomplishments | Core Architectural Pattern | Detailed Log Link |
 | --- | --- | --- | --- | --- |
@@ -189,6 +202,7 @@ Prometheus `HighErrorRate` rule transitioning to `FIRING` during simulated backe
 | **Day 7** | Cloud Migration (EC2) | Terraform IaC for EC2 `t3.micro`, Docker bridge network `llm-net`, IP-scoped security groups, GHCR pull. | Production IaC scaffolding and zero-leakage teardown | [Day 7 Log](#day-7-cloud-migration-aws-ec2-via-terraform) |
 | **Day 8** | Managed EKS and IRSA | EKS v1.35, managed node groups, OIDC / IRSA for EBS CSI driver, dynamic gp3 StorageClass, resource tuning. | Least-privilege IRSA and portable K8s manifests | [Day 8 Log](#day-8-cloud-native-migration-eks-irsa-and-production-kubernetes-friction) |
 | **Day 9** | Cloud Observability and ELB | EKS re-provisioning via IaC, public AWS Classic ELB, live alert validation, multi-AZ EBS analysis. | End-to-end cloud reproducibility and SRE validation | [Day 9 Log](#day-9-observability-on-eks-public-exposure-and-cross-environment-validation) |
+| **Day 10** | CD Loop and Consolidation | Closed CD loop with automated GitOps manifest patch workflow, curated screenshots, executive documentation. | Closed-loop GitOps deployment and portfolio consolidation | [Day 10 Log](#day-10-cd-loop-completion-gitops-automation-and-portfolio-consolidation) |
 
 ---
 
@@ -635,6 +649,70 @@ curl -X POST http://a8931d61cc54f4205beb65058c6ebfc5-1730394859.ap-south-1.elb.a
 #  that distributes traffic evenly across multiple servers or instances, enabling the
 #  server or instance to handle an increasing number of concurrent connections while
 #  minimizing the impact of a single server or instance failure.","done":true}
+```
+
+---
+
+---
+
+### Day 10: CD Loop Completion, GitOps Automation and Portfolio Consolidation
+
+#### Accomplished
+
+- Automated GitOps Continuous Delivery (CD) loop engineered within GitHub Actions (`.github/workflows/ci.yaml`):
+  - Added dedicated `deploy` workflow job executing on pushes to `main`
+  - Dynamically extracts the published container image tag (Git commit SHA) from the build step
+  - Automatically updates the deployment manifest (`k8s/api-deployment.yaml`) with the exact immutable image reference
+  - Automatically commits and pushes the updated manifest back to the repository using `[skip ci]` to prevent workflow loops
+- Curated and centralized top production verification artifacts into a dedicated `docs/screenshots/` repository directory:
+  - `01_eks_elb_public_endpoint_verification.png` — Public Load Balancer live endpoint verification
+  - `02_eks_golden_signals_dashboard.png` — Full Grafana Golden Signals observability on AWS EKS
+  - `03_eks_prometheus_alert_firing.png` — Live Prometheus incident alerting lifecycle
+- Authored professional top-level platform documentation (`README.md`):
+  - Tech stack badges and executive project summary
+  - Production architecture and service topology diagrams
+  - Dedicated "Key Engineering Decisions" section covering Free Tier capacity planning, IRSA least privilege, EBS multi-AZ tradeoffs, and teardown discipline
+  - 10-day milestone summary table with direct links to all daily technical and debugging logs
+  - Zero-emoji formatting strictly maintained across the entire portfolio
+
+#### Architectural Rationale and Design Patterns
+
+- **GitOps Manifest Synchronization over Imperative Cluster Mutation**: Rather than executing imperative `kubectl set image` commands against a remote cluster from CI runners (which requires storing long-lived cloud credentials in GitHub Secrets and creates configuration drift between Git and the cluster), the CD loop declaratively updates `k8s/api-deployment.yaml` in Git. This makes the Git repository the absolute single source of truth for the desired cluster state.
+- **Workflow Loop Prevention (`[skip ci]`)**: Automated commits generated by GitHub Actions bots include the `[skip ci]` commit directive to prevent recursive CI triggering while preserving full commit history and audit trails.
+- **Documentation as an SRE Artifact**: Designed the README to serve as an operational runbook and architectural defense document, explicitly articulating failure modes, root cause analyses, and trade-off rationales encountered throughout the 10-day engineering sprint.
+
+#### Completed End-to-End GitOps Continuous Delivery Loop
+
+```text
+  Developer / Feature Branch
+              │
+              │ Git Push / Pull Request
+              ▼
+   ┌──────────────────────┐
+   │ GitHub Actions CI/CD │
+   └──────────┬───────────┘
+              │
+              ├─► Job 1: Lint & Unit Tests (Ruff, Pytest)
+              │
+              ├─► Job 2: Build & Push Container (GHCR with Git SHA)
+              │
+              └─► Job 3: GitOps CD Sync
+                         │
+                         ├─► Extract Image Tag (SHA)
+                         ├─► Update k8s/api-deployment.yaml
+                         └─► Git Commit & Push to main [skip ci]
+                                    │
+                                    ▼
+                         ┌──────────────────────┐
+                         │   Git Repository     │
+                         │ (Single Source Truth)│
+                         └──────────┬───────────┘
+                                    │
+                                    ▼
+                         ┌──────────────────────┐
+                         │   AWS EKS Cluster    │
+                         │ (llm-serving / apps) │
+                         └──────────────────────┘
 ```
 
 ---
