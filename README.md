@@ -723,12 +723,12 @@ curl -X POST http://a8931d61cc54f4205beb65058c6ebfc5-1730394859.ap-south-1.elb.a
 llm-devops/
 ├── .github/
 │   └── workflows/
-│       └── ci.yaml                    # Automated lint, test, build, push, & manifest sync
+│       └── ci.yaml                    # Automated lint, test, build, push, & manifest 
 ├── app/
-│   ├── Dockerfile                     # Optimized Python 3.11 container image
+│   ├── Dockerfile                     # Optimized Python 3.11 container image 
 │   ├── main.py                        # FastAPI inference gateway with Prometheus metrics
 │   ├── requirements.txt               # App dependencies (FastAPI, httpx, instrumentator)
-│   └── tests/
+│   └── tests/                         # Tests folder
 │       ├── __init__.py
 │       └── test_main.py               # Automated pytest suite for API & health logic
 ├── docs/
