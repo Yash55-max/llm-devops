@@ -17,7 +17,7 @@ provider "aws" {
 }
 
 # -----------------------------------------------------------------------------
-# 1. VPC & Networking for EKS
+# 1. VPC & Networking for Elastic Kubernetes Service on AWS
 # -----------------------------------------------------------------------------
 data "aws_availability_zones" "available" {
   state = "available"
